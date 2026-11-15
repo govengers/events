@@ -50,7 +50,8 @@ type PreparedEvent struct {
 func (e *PreparedEvent) Topic() string { return e.topic }
 
 // EncodeData returns the event's data as JSON. It fails with ErrInvalidTopic for a malformed topic
-// (also for a zero PreparedEvent), and with the encoding error when the data cannot be encoded.
+// (also for a zero PreparedEvent), with the encoding error when the data cannot be encoded, and
+// with ErrNulCharacter for data with a NUL character.
 func (e *PreparedEvent) EncodeData() (json.RawMessage, error) {
 	if err := ValidateTopic(e.topic); err != nil {
 		return nil, err
@@ -58,6 +59,9 @@ func (e *PreparedEvent) EncodeData() (json.RawMessage, error) {
 	data, err := json.Marshal(e.data)
 	if err != nil {
 		return nil, fmt.Errorf("encode data of %s: %w", e.topic, err)
+	}
+	if hasNulCharacter(data) {
+		return nil, fmt.Errorf("%w: %s", ErrNulCharacter, e.topic)
 	}
 	return data, nil
 }

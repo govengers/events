@@ -1,6 +1,7 @@
 package events
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"time"
@@ -16,8 +17,34 @@ const SpecVersion = "1.0"
 const ContentType = "application/cloudevents+json"
 
 // MaximumEventBytes caps an encoded event: Publish refuses a larger one with ErrEventTooLarge,
-// and the inbox answers 413. Events carry references, not documents (J2).
-const MaximumEventBytes = 256 << 10
+// and the inbox answers 413. Events carry references, not documents (J2). The handler's job
+// carries the event, and jobs caps a payload at 256 KiB of jsonb, which takes up to six times
+// the JSON text (an array of small numbers); 32 KiB of text stays below that in every shape (E23).
+const MaximumEventBytes = 32 << 10
+
+// ErrNulCharacter is returned by Publish for data with a NUL character (U+0000): PostgreSQL's
+// jsonb, which holds the handler's job, cannot store it. The inbox answers 400 for such an event.
+var ErrNulCharacter = errors.New("events: NUL character in the data")
+
+// hasNulCharacter reports whether JSON text carries the escape \u0000 outside an escaped
+// backslash; encoding/json writes a NUL character so.
+func hasNulCharacter(encoded []byte) bool {
+	for offset := 0; ; {
+		found := bytes.Index(encoded[offset:], []byte(`\u0000`))
+		if found < 0 {
+			return false
+		}
+		index := offset + found
+		backslashes := 0
+		for before := index - 1; before >= 0 && encoded[before] == '\\'; before-- {
+			backslashes++
+		}
+		if backslashes%2 == 0 {
+			return true
+		}
+		offset = index + 1
+	}
+}
 
 // Event is the envelope of every event: CloudEvents 1.0 in structured JSON mode (E3), with the
 // extensions traceparent and tracestate (W3C trace context) and actor (the publisher's acting

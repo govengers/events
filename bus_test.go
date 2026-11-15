@@ -393,3 +393,63 @@ func TestTheDefaultClientRefusesInternalAddressesForGood(t *testing.T) {
 	require.Equal(t, events.DeliveryFailed, entry.Status, "no retry")
 	require.Contains(t, entry.LastError, "blocked address")
 }
+
+// largestEvent prepares an event of the jsonb-heaviest shape, an array of zeros, as close to
+// MaximumEventBytes as the envelope leaves room for.
+func largestEvent(t *testing.T) (*events.Topic[[]int], *events.PreparedEvent) {
+	t.Helper()
+	topic := events.NewTopic[[]int](orderPlacedTopic.Name())
+	return topic, topic.New(make([]int, (events.MaximumEventBytes-1024)/2))
+}
+
+func TestAnEventAtTheLimitReachesARemoteHandler(t *testing.T) {
+	ctx := context.Background()
+	orders := newService(t, "orders", nil)
+	billing := newService(t, "billing", &serviceOptions{configure: func(options *events.Options) {
+		options.Publishers = []events.Publisher{publisherOf(orders)}
+	}})
+	topic, event := largestEvent(t)
+	var handled atomic.Int32
+	require.NoError(t, events.Subscribe(billing.bus, topic, func(_ context.Context, message *events.Message[[]int]) error {
+		handled.Store(int32(len(message.Data)))
+		return nil
+	}, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, billing.bus.Register(ctx))
+	require.Equal(t, 1, billing.drain(t))
+
+	ids, err := orders.store.Publish(ctx, orders.pool, event)
+	require.NoError(t, err)
+	require.Equal(t, 1, orders.drain(t))
+	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: ids[0]})
+	require.Equal(t, events.DeliveryDelivered, entry.Status, "the inbox took the bytes Publish checked: %s", entry.LastError)
+	require.Equal(t, 1, billing.drain(t))
+	require.Equal(t, int32((events.MaximumEventBytes-1024)/2), handled.Load())
+}
+
+func TestAnEventAtTheLimitReachesALocalHandler(t *testing.T) {
+	ctx := context.Background()
+	orders := newService(t, "orders", nil)
+	topic, event := largestEvent(t)
+	var handled atomic.Bool
+	require.NoError(t, events.Subscribe(orders.bus, topic, func(context.Context, *events.Message[[]int]) error {
+		handled.Store(true)
+		return nil
+	}, &events.SubscribeOptions{Name: "count"}))
+	require.NoError(t, orders.bus.Register(ctx))
+	_, err := orders.store.Publish(ctx, orders.pool, event)
+	require.NoError(t, err, "the job's jsonb payload stays within jobs' cap")
+	require.Equal(t, 1, orders.drain(t))
+	require.True(t, handled.Load())
+}
+
+func TestANulCharacterIsRefusedBeforeTheFirstWrite(t *testing.T) {
+	ctx := context.Background()
+	orders, _, _ := remotePair(t, nil)
+	transaction, err := orders.pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = transaction.Rollback(ctx) }()
+	_, err = orders.store.Publish(ctx, transaction, orderPlacedTopic.New(OrderPlaced{OrderID: "a\x00b"}))
+	require.ErrorIs(t, err, events.ErrNulCharacter)
+	_, err = orders.store.Publish(ctx, transaction, orderPlacedTopic.New(OrderPlaced{OrderID: `a\u0000b`}))
+	require.NoError(t, err, "the caller's transaction is intact, and the text \\u0000 is no NUL")
+}

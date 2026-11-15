@@ -17,7 +17,8 @@ import (
 // topic and then, in one transaction, stores the event's key and enqueues the handler's job.
 // It answers 202 for a new and a duplicate delivery alike, 404 for an unknown subscription (the
 // publisher retries: this service may be mid-rollout), 401 for a bad signature, 400 for a body
-// that is not an event of the subscription's topic, 413 above MaximumEventBytes.
+// that is not an event of the subscription's topic or carries a NUL character, 413 above
+// MaximumEventBytes.
 func (b *Bus) InboxHandler() http.Handler {
 	return http.HandlerFunc(b.receive)
 }
@@ -94,6 +95,9 @@ func decodeEvent(body []byte, topic string) (*Event, error) {
 	var event Event
 	if err := json.Unmarshal(body, &event); err != nil {
 		return nil, fmt.Errorf("decode the event: %w", err)
+	}
+	if hasNulCharacter(body) {
+		return nil, ErrNulCharacter
 	}
 	switch {
 	case event.SpecVersion != SpecVersion:

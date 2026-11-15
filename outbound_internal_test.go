@@ -40,3 +40,11 @@ func TestRetryAfterIsCappedWithoutOverflow(t *testing.T) {
 	require.Zero(t, retryAfter("0"))
 	require.Zero(t, retryAfter("Wed, 21 Oct 2015 07:28:00 GMT"))
 }
+
+func TestHasNulCharacter(t *testing.T) {
+	require.True(t, hasNulCharacter([]byte(`"a\u0000b"`)))
+	require.True(t, hasNulCharacter([]byte(`"\\\u0000"`)), "an escaped backslash, then a NUL")
+	require.False(t, hasNulCharacter([]byte(`"\\u0000"`)), "the text \\u0000")
+	require.True(t, hasNulCharacter([]byte(`["\\u0000","\u0000"]`)), "the second one")
+	require.False(t, hasNulCharacter([]byte(`"\u0001"`)))
+}
