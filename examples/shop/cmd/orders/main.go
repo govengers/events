@@ -56,7 +56,7 @@ func run() error {
 	}
 	bus, err := events.New(&events.Options{
 		Name: "orders", Store: components.Events, Worker: components.Worker, HTTPClient: client,
-		Authorize: authorizeByAPIKey(os.Getenv("ORDERS_API_KEYS")), AllowHTTPEndpoints: os.Getenv("SHOP_LOOPBACK") == "1",
+		Authorize: authorizeByAPIKey(os.Getenv("ORDERS_API_KEYS")), AllowHTTP: os.Getenv("SHOP_LOOPBACK") == "1",
 	})
 	if err != nil {
 		return err
@@ -79,9 +79,9 @@ func authorizeByAPIKey(configured string) events.AuthorizeFunc {
 			keys[subscriber] = key
 		}
 	}
-	return func(request *http.Request, subscriber string, _ []string) error {
+	return func(request *http.Request, registration *events.RegistrationRequest) error {
 		presented, _ := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
-		key, known := keys[subscriber]
+		key, known := keys[registration.Subscriber]
 		if !known || subtle.ConstantTimeCompare([]byte(presented), []byte(key)) != 1 {
 			return errors.New("unknown API key")
 		}

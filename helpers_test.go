@@ -83,8 +83,8 @@ func newService(t *testing.T, name string, adjust *serviceOptions) *service {
 		Name: name, Store: created.store, Worker: created.worker, Observer: created.observer,
 		HTTPClient: &http.Client{Transport: transport, Timeout: 10 * time.Second},
 		InboxKey:   inboxKey, InboxURL: created.server.URL + "/events",
-		Authorize:          func(*http.Request, string, []string) error { return nil },
-		AllowHTTPEndpoints: true,
+		Authorize: func(*http.Request, *events.RegistrationRequest) error { return nil },
+		AllowHTTP: true,
 	}
 	if adjust.configure != nil {
 		adjust.configure(options)

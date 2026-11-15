@@ -3,6 +3,8 @@ package events
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"slices"
 
 	"github.com/govengers/jobs"
 )
@@ -18,10 +19,26 @@ import (
 // maximumRegistrationBytes caps a registration's body: a few hundred subscriptions.
 const maximumRegistrationBytes = 1 << 20
 
-// registrationPayload is the registration job's payload: the set is computed when the job runs,
-// from the subscriptions this process declared, so the newest code is the source of truth.
+// registrationPayload is the registration job's payload: the set Register computed, so whichever
+// replica claims the job sends the set of the code that enqueued it, also mid-rollout. It holds no
+// secret: the claiming process derives them, and only one with the same inbox key may.
 type registrationPayload struct {
-	Publisher string `json:"publisher"`
+	Publisher     string                 `json:"publisher"`
+	InboxURL      string                 `json:"inboxUrl"`
+	InboxKeyID    string                 `json:"inboxKeyId"`
+	Subscriptions []declaredSubscription `json:"subscriptions"`
+}
+
+// declaredSubscription is one remote subscription of a registration job.
+type declaredSubscription struct {
+	Name  string `json:"name"`
+	Topic string `json:"topic"`
+}
+
+// inboxKeyID names an inbox key without revealing it.
+func inboxKeyID(key []byte) string {
+	digest := sha256.Sum256(append([]byte("govengers.events inbox key\x00"), key...))
+	return hex.EncodeToString(digest[:8])
 }
 
 // registrationBody is the body of PUT {publisher}/subscribers/{subscriber}.
@@ -36,14 +53,16 @@ type registeredSubscription struct {
 	Secret   string `json:"secret"`
 }
 
-// register is the handler of the registration job: it sends the publisher this service's
-// complete set of subscriptions to it. 2xx completes, 400 is permanent, everything else retries.
+// register is the handler of the registration job: it sends the publisher the job's complete set
+// of this service's subscriptions to it. 2xx completes, 400 is permanent, everything else
+// retries, also a job this process cannot send (another version's publisher or inbox key).
 func (b *Bus) register(ctx context.Context, job *jobs.Job[registrationPayload]) error {
 	publisher, known := b.publishers[job.Payload.Publisher]
-	if !known {
-		return jobs.Permanent(fmt.Errorf("publisher %s is no longer declared", job.Payload.Publisher))
+	if !known || job.Payload.InboxKeyID != inboxKeyID(b.inboxKey) {
+		// a job of another version of this service, mid-rollout: a replica of that version claims a later attempt
+		return fmt.Errorf("the registration at %s needs a replica that declares the publisher and holds the job's inbox key", job.Payload.Publisher)
 	}
-	body := registrationBody{Subscriptions: b.remoteSubscriptions(publisher.Name)}
+	body := registrationBody{Subscriptions: b.registeredSubscriptions(&job.Payload)}
 	registration := &Registration{Publisher: publisher.Name, Subscriber: b.name, Subscriptions: len(body.Subscriptions)}
 	defer func() { b.observer.Registered(registration) }()
 	registration.StatusCode, registration.Err = b.sendRegistration(ctx, publisher, &body)
@@ -53,18 +72,15 @@ func (b *Bus) register(ctx context.Context, job *jobs.Job[registrationPayload]) 
 	return registration.Err
 }
 
-func (b *Bus) remoteSubscriptions(publisher string) []registeredSubscription {
-	b.mutex.RLock()
-	defer b.mutex.RUnlock()
-	registered := []registeredSubscription{}
-	for _, declared := range b.subscriptions {
-		if declared.publisher == publisher {
-			registered = append(registered, registeredSubscription{
-				Name: declared.name, Topic: declared.topic,
-				Endpoint: b.inboxURL + "/" + url.PathEscape(declared.name),
-				Secret:   DeriveSecret(b.inboxKey, declared.name),
-			})
-		}
+// registeredSubscriptions adds endpoints and secrets to the job's set.
+func (b *Bus) registeredSubscriptions(payload *registrationPayload) []registeredSubscription {
+	registered := make([]registeredSubscription, 0, len(payload.Subscriptions))
+	for _, declared := range payload.Subscriptions {
+		registered = append(registered, registeredSubscription{
+			Name: declared.Name, Topic: declared.Topic,
+			Endpoint: payload.InboxURL + "/" + url.PathEscape(declared.Name),
+			Secret:   DeriveSecret(b.inboxKey, declared.Name),
+		})
 	}
 	return registered
 }
@@ -100,9 +116,9 @@ func (b *Bus) sendRegistration(ctx context.Context, publisher Publisher, body *r
 // {base}/subscribers/{subscriber} with the subscriber's complete set of subscriptions, which
 // replaces its earlier set in one transaction. The subscriber is the last segment of the request
 // path. Mount it behind the application's authentication (an API key, E8); Options.Authorize
-// then decides whether the caller may register that subscriber for those topics, and nil
-// Authorize refuses everything. It answers 204 on success, 400 for an invalid set, 403 when
-// refused.
+// then decides whether the caller may register that subscriber with those topics and endpoints,
+// and nil Authorize refuses everything. It answers 204 on success, 400 for an invalid set, 403
+// when refused or when the subscriber is this service itself.
 func (b *Bus) RegistrationHandler() http.Handler {
 	return http.HandlerFunc(b.acceptRegistration)
 }
@@ -134,6 +150,10 @@ func (b *Bus) storeRegistration(writer http.ResponseWriter, request *http.Reques
 	if err := ValidateName(registration.Subscriber); err != nil {
 		return http.StatusBadRequest, err
 	}
+	if registration.Subscriber == b.name {
+		// it would replace this service's own local subscriptions
+		return http.StatusForbidden, errors.New("a registration cannot name this service as its subscriber")
+	}
 	var body registrationBody
 	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, maximumRegistrationBytes))
 	if err := decoder.Decode(&body); err != nil {
@@ -144,7 +164,7 @@ func (b *Bus) storeRegistration(writer http.ResponseWriter, request *http.Reques
 		return http.StatusBadRequest, err
 	}
 	registration.Subscriptions = len(subscriptions)
-	if err := b.authorize(request, registration.Subscriber, topicsOf(subscriptions)); err != nil {
+	if err := b.authorize(request, authorizationRequest(registration.Subscriber, subscriptions)); err != nil {
 		return http.StatusForbidden, err
 	}
 	if err := b.store.PutSubscriptions(request.Context(), registration.Subscriber, subscriptions); err != nil {
@@ -167,7 +187,7 @@ func (b *Bus) validateRegistration(subscriber string, registered []registeredSub
 		if err := ValidateTopic(entry.Topic); err != nil {
 			return nil, fmt.Errorf("subscription %s: %w", entry.Name, err)
 		}
-		if err := ValidateEndpoint(entry.Endpoint, b.allowHTTPEndpoints); err != nil {
+		if err := ValidateEndpoint(entry.Endpoint, b.allowHTTP); err != nil {
 			return nil, fmt.Errorf("subscription %s: %w", entry.Name, err)
 		}
 		if err := ValidateSecret(entry.Secret); err != nil {
@@ -180,14 +200,14 @@ func (b *Bus) validateRegistration(subscriber string, registered []registeredSub
 	return subscriptions, nil
 }
 
-func topicsOf(subscriptions []Subscription) []string {
-	topics := make([]string, 0, len(subscriptions))
+// authorizationRequest is the registration without its secrets.
+func authorizationRequest(subscriber string, subscriptions []Subscription) *RegistrationRequest {
+	request := &RegistrationRequest{Subscriber: subscriber, Subscriptions: make([]Subscription, 0, len(subscriptions))}
 	for _, subscription := range subscriptions {
-		if !slices.Contains(topics, subscription.Topic) {
-			topics = append(topics, subscription.Topic)
-		}
+		subscription.Secret = ""
+		request.Subscriptions = append(request.Subscriptions, subscription)
 	}
-	return topics
+	return request
 }
 
 // ErrInvalidEndpoint is returned for an endpoint that is not an absolute https URL (or http with

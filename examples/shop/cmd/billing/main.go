@@ -59,7 +59,7 @@ func run() error {
 	}
 	bus, err := events.New(&events.Options{
 		Name: "billing", Store: components.Events, Worker: components.Worker, HTTPClient: client,
-		InboxKey: inboxKey, InboxURL: os.Getenv("INBOX_URL"),
+		InboxKey: inboxKey, InboxURL: os.Getenv("INBOX_URL"), AllowHTTP: os.Getenv("SHOP_LOOPBACK") == "1",
 		Publishers: []events.Publisher{{Name: "orders", URL: os.Getenv("ORDERS_URL"), APIKey: os.Getenv("ORDERS_API_KEY")}},
 	})
 	if err != nil {

@@ -144,12 +144,12 @@ func registrationOf(entries ...registered) map[string]any {
 }
 
 func TestTheRegistrationRefusesInvalidAndUnauthorizedSets(t *testing.T) {
-	var authorizedTopics []string
+	var authorized *events.RegistrationRequest
 	orders := newService(t, "orders", &serviceOptions{configure: func(options *events.Options) {
-		options.AllowHTTPEndpoints = false
-		options.Authorize = func(_ *http.Request, subscriber string, topics []string) error {
-			authorizedTopics = topics
-			if subscriber != "billing" {
+		options.AllowHTTP, options.InboxURL = false, ""
+		options.Authorize = func(_ *http.Request, registration *events.RegistrationRequest) error {
+			authorized = registration
+			if registration.Subscriber != "billing" && registration.Subscriber != "orders" {
 				return errors.New("unknown subscriber")
 			}
 			return nil
@@ -169,6 +169,7 @@ func TestTheRegistrationRefusesInvalidAndUnauthorizedSets(t *testing.T) {
 		status  int
 	}{
 		"another subscriber":    {registrationRequest(t, "shipping", registrationOf(valid)), http.StatusForbidden},
+		"the publisher itself":  {registrationRequest(t, "orders", registrationOf(valid)), http.StatusForbidden},
 		"an invalid subscriber": {registrationRequest(t, "Billing", registrationOf(valid)), http.StatusBadRequest},
 		"an http endpoint":      {registrationRequest(t, "billing", registrationOf(withEndpoint)), http.StatusBadRequest},
 		"a malformed secret":    {registrationRequest(t, "billing", registrationOf(withSecret)), http.StatusBadRequest},
@@ -191,7 +192,9 @@ func TestTheRegistrationRefusesInvalidAndUnauthorizedSets(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	orders.bus.RegistrationHandler().ServeHTTP(recorder, registrationRequest(t, "billing", registrationOf(valid)))
 	require.Equal(t, http.StatusNoContent, recorder.Code)
-	require.Equal(t, []string{orderPlacedTopic.Name()}, authorizedTopics)
+	require.Equal(t, &events.RegistrationRequest{Subscriber: "billing", Subscriptions: []events.Subscription{{
+		Subscriber: "billing", Name: valid.Name, Topic: valid.Topic, Endpoint: valid.Endpoint,
+	}}}, authorized, "Authorize sees the endpoints, not the secrets")
 
 	recorder = httptest.NewRecorder()
 	orders.bus.RegistrationHandler().ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/events/subscribers/billing", nil))

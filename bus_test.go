@@ -10,6 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/govengers/events"
+	"github.com/govengers/events/postgresadapter"
+	"github.com/govengers/jobs"
+	"github.com/govengers/jobs/jobstest"
+	jobspostgres "github.com/govengers/jobs/postgresadapter"
 )
 
 func TestALocalSubscriptionReceivesEventsOfCommittedTransactionsOnly(t *testing.T) {
@@ -325,6 +329,85 @@ func TestARegistrationRetriesUntilThePublisherAnswers(t *testing.T) {
 	require.Len(t, billing.observer.registrations, 2)
 	require.Equal(t, http.StatusServiceUnavailable, billing.observer.registrations[0].StatusCode)
 	require.Equal(t, http.StatusNoContent, billing.observer.registrations[1].StatusCode)
+}
+
+// replica is another replica of service s, of another version: its own worker and bus on the
+// same database and store. configure adjusts the bus's options.
+func (s *service) replica(t *testing.T, configure func(options *events.Options)) (*events.Bus, *jobs.Worker) {
+	t.Helper()
+	jobStore, err := jobspostgres.New(&jobspostgres.Options{Pool: s.pool})
+	require.NoError(t, err)
+	worker, err := jobs.NewWorker(&jobs.WorkerOptions{Store: jobStore, Queues: map[string]jobs.QueueOptions{events.Queue: {}, events.SubscriberQueue(s.name): {}}})
+	require.NoError(t, err)
+	options := &events.Options{
+		Name: s.name, Store: s.store, Worker: worker, HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		InboxKey: inboxKey, InboxURL: s.server.URL + "/events", AllowHTTP: true,
+	}
+	if configure != nil {
+		configure(options)
+	}
+	bus, err := events.New(options)
+	require.NoError(t, err)
+	return bus, worker
+}
+
+func registeredNames(t *testing.T, publisher *service, subscriber string) []string {
+	t.Helper()
+	records, err := publisher.store.Subscriptions(context.Background(), &postgresadapter.SubscriptionFilter{Subscriber: subscriber})
+	require.NoError(t, err)
+	names := []string{}
+	for _, record := range records {
+		names = append(names, record.Name)
+	}
+	return names
+}
+
+func TestAnOldReplicaSendsTheSetOfTheReplicaThatRegistered(t *testing.T) {
+	ctx := context.Background()
+	orders := newService(t, "orders", nil)
+	old := newService(t, "billing", &serviceOptions{configure: func(options *events.Options) {
+		options.Publishers = []events.Publisher{publisherOf(orders)}
+	}})
+	var invoices received
+	require.NoError(t, events.Subscribe(old.bus, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, old.bus.Register(ctx))
+	require.Equal(t, 1, old.drain(t))
+
+	next, nextWorker := old.replica(t, func(options *events.Options) { options.Publishers = []events.Publisher{publisherOf(orders)} })
+	require.NoError(t, events.Subscribe(next, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, events.Subscribe(next, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "send-receipt", Publisher: "orders"}))
+	require.NoError(t, next.Register(ctx))
+	require.Equal(t, 1, old.drain(t), "the old replica claims the new replica's job")
+	require.Zero(t, jobstest.Drain(t, nextWorker))
+	require.Equal(t, []string{"create-invoice", "send-receipt"}, registeredNames(t, orders, "billing"))
+}
+
+func TestAReplicaWithoutThePublisherOrTheInboxKeyLeavesTheRegistrationToAnother(t *testing.T) {
+	ctx := context.Background()
+	orders := newService(t, "orders", nil)
+	old := newService(t, "billing", nil) // declares no publisher
+	other, otherWorker := old.replica(t, func(options *events.Options) {
+		options.Publishers = []events.Publisher{publisherOf(orders)}
+		options.InboxKey = []byte("another-inbox-key-0123456789abcdef")
+	})
+	next, nextWorker := old.replica(t, func(options *events.Options) { options.Publishers = []events.Publisher{publisherOf(orders)} })
+	var invoices received
+	require.NoError(t, events.Subscribe(other, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, events.Subscribe(next, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, next.Register(ctx))
+
+	require.Equal(t, 1, old.drain(t), "a replica without the publisher retries")
+	old.makeDue(t)
+	require.Equal(t, 1, jobstest.Drain(t, otherWorker), "a replica with another inbox key retries")
+	require.Empty(t, registeredNames(t, orders, "billing"))
+	old.makeDue(t)
+	require.Equal(t, 1, jobstest.Drain(t, nextWorker))
+	require.Equal(t, []string{"create-invoice"}, registeredNames(t, orders, "billing"))
+
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	delivery, err := orders.store.Delivery(ctx, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id})
+	require.NoError(t, err)
+	require.Equal(t, events.DeriveSecret(inboxKey, "create-invoice"), delivery.Secret, "the secret of the job's inbox key")
 }
 
 func TestTheSweepScheduleRunsTheStoresSweep(t *testing.T) {

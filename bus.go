@@ -2,11 +2,13 @@ package events
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -42,14 +44,21 @@ var (
 type Publisher struct {
 	Name string // the publisher's service name, unique among this service's publishers
 	// URL is the base of the publisher's events routes: registration is PUT URL/subscribers/{subscriber}.
-	URL    string
+	URL    string // https unless Options.AllowHTTP
 	APIKey string // this service's API key at the publisher, sent as "Authorization: Bearer"
 }
 
-// AuthorizeFunc decides whether the caller of a registration may register subscriber with these
-// topics. The request's context carries what the application's authentication middleware put
-// there. A non-nil error answers 403.
-type AuthorizeFunc func(request *http.Request, subscriber string, topics []string) error
+// AuthorizeFunc decides whether the caller of a registration may register it: that subscriber,
+// those topics and those endpoints. The request's context carries what the application's
+// authentication middleware put there. A non-nil error answers 403.
+type AuthorizeFunc func(request *http.Request, registration *RegistrationRequest) error
+
+// RegistrationRequest is a validated registration as AuthorizeFunc sees it.
+type RegistrationRequest struct {
+	Subscriber string
+	// Subscriptions are the complete new set; each has its Name, Topic and Endpoint, no Secret.
+	Subscriptions []Subscription
+}
 
 // Options configures a Bus.
 type Options struct {
@@ -63,14 +72,16 @@ type Options struct {
 	// required for remote subscriptions, at least 32 bytes. Rotating it and calling Register
 	// rotates every secret.
 	InboxKey []byte
-	// InboxURL is the public base URL of this service's inbox handler; a subscription's
-	// endpoint is InboxURL/{subscription}. Required for remote subscriptions.
+	// InboxURL is the public base URL of this service's inbox handler, https unless AllowHTTP; a
+	// subscription's endpoint is InboxURL/{subscription}. Required for remote subscriptions.
 	InboxURL   string
 	Publishers []Publisher // the remote services this service subscribes to
 	// Authorize guards RegistrationHandler; nil refuses every registration.
 	Authorize AuthorizeFunc
-	// AllowHTTPEndpoints accepts registrations with http:// endpoints; by default only https.
-	AllowHTTPEndpoints bool
+	// AllowHTTP accepts http:// for the endpoints of registrations, Options.InboxURL and the
+	// URLs of Options.Publishers; by default only https, because a registration carries the API
+	// key and the signing secrets.
+	AllowHTTP bool
 	// DisableAfter disables a remote subscription after this many deliveries in a row failed;
 	// zero means DefaultDisableAfter. Enable it again with the store's EnableSubscription, or the
 	// subscriber's next registration.
@@ -91,19 +102,19 @@ const minimumInboxKeyBytes = 32
 // subscriptions at publishers and accepts registrations of subscribers. It is safe for
 // concurrent use; Subscribe before the worker runs.
 type Bus struct {
-	name               string
-	store              Store
-	worker             *jobs.Worker
-	client             *http.Client
-	inboxKey           []byte
-	inboxURL           string
-	publishers         map[string]Publisher
-	authorize          AuthorizeFunc
-	allowHTTPEndpoints bool
-	disableAfter       int
-	propagators        []jobs.Propagator
-	observer           Observer
-	now                func() time.Time
+	name         string
+	store        Store
+	worker       *jobs.Worker
+	client       *http.Client
+	inboxKey     []byte
+	inboxURL     string
+	publishers   map[string]Publisher
+	authorize    AuthorizeFunc
+	allowHTTP    bool
+	disableAfter int
+	propagators  []jobs.Propagator
+	observer     Observer
+	now          func() time.Time
 
 	mutex         sync.RWMutex
 	subscriptions map[string]*subscription // by name
@@ -123,7 +134,7 @@ func New(options *Options) (*Bus, error) {
 	if err := validateOptions(options); err != nil {
 		return nil, err
 	}
-	publishers, err := publishersByName(options.Publishers)
+	publishers, err := publishersByName(options.Publishers, options.AllowHTTP)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +148,7 @@ func New(options *Options) (*Bus, error) {
 	bus := &Bus{
 		name: options.Name, store: options.Store, worker: options.Worker, client: client,
 		inboxKey: append([]byte(nil), options.InboxKey...), inboxURL: strings.TrimSuffix(options.InboxURL, "/"),
-		publishers: publishers, authorize: options.Authorize, allowHTTPEndpoints: options.AllowHTTPEndpoints,
+		publishers: publishers, authorize: options.Authorize, allowHTTP: options.AllowHTTP,
 		disableAfter: orDefault(options.DisableAfter, DefaultDisableAfter),
 		propagators:  append([]jobs.Propagator(nil), options.Propagators...),
 		observer:     GuardObserver(options.Observer), now: options.Now,
@@ -162,6 +173,11 @@ func validateOptions(options *Options) error {
 	if options.DisableAfter < 0 {
 		return errors.New("events: negative Options.DisableAfter")
 	}
+	if options.InboxURL != "" {
+		if err := ValidateEndpoint(options.InboxURL, options.AllowHTTP); err != nil {
+			return fmt.Errorf("events: Options.InboxURL: %w", err)
+		}
+	}
 	for index, propagator := range options.Propagators {
 		if propagator == nil {
 			return fmt.Errorf("events: Options.Propagators[%d] is nil", index)
@@ -170,7 +186,7 @@ func validateOptions(options *Options) error {
 	return nil
 }
 
-func publishersByName(publishers []Publisher) (map[string]Publisher, error) {
+func publishersByName(publishers []Publisher, allowHTTP bool) (map[string]Publisher, error) {
 	byName := make(map[string]Publisher, len(publishers))
 	for _, publisher := range publishers {
 		if err := ValidateName(publisher.Name); err != nil {
@@ -179,7 +195,7 @@ func publishersByName(publishers []Publisher) (map[string]Publisher, error) {
 		if _, exists := byName[publisher.Name]; exists {
 			return nil, fmt.Errorf("events: publisher %s is declared twice", publisher.Name)
 		}
-		if _, err := url.ParseRequestURI(publisher.URL); err != nil {
+		if err := ValidateEndpoint(publisher.URL, allowHTTP); err != nil {
 			return nil, fmt.Errorf("events: publisher %s: URL: %w", publisher.Name, err)
 		}
 		byName[publisher.Name] = publisher
@@ -312,22 +328,44 @@ func decodeMessage[P any](event *Event, topic string) (*Message[P], error) {
 
 // Register writes this service's local subscriptions into its own database and enqueues one
 // registration job per publisher, which sends that publisher the complete set of this
-// service's subscriptions to it (E5) and retries until the publisher answers. Call it at
-// startup after the last Subscribe; it returns once the jobs are enqueued, so the service starts
-// while a publisher is down. A declared publisher without subscriptions gets the empty set,
-// which removes earlier ones.
+// service's subscriptions to it (E5) and retries until the publisher answers. The job carries the
+// set (names and topics), so a replica of another version that claims it sends this set. Call it
+// at startup after the last Subscribe; it returns once the jobs are enqueued, so the service
+// starts while a publisher is down. A declared publisher without subscriptions gets the empty
+// set, which removes earlier ones.
 func (b *Bus) Register(ctx context.Context) error {
 	if err := b.store.PutSubscriptions(ctx, b.name, b.localSubscriptions()); err != nil {
 		return fmt.Errorf("events: register the local subscriptions: %w", err)
 	}
 	registrations := make([]*jobs.PreparedJob, 0, len(b.publishers))
 	for name := range b.publishers {
-		registrations = append(registrations, registerKind.New(registrationPayload{Publisher: name}, &jobs.EnqueueOptions{UniqueKey: name}))
+		payload := b.registration(name)
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("events: encode the registration at %s: %w", name, err)
+		}
+		digest := sha256.Sum256(encoded) // a pending job of another set is not coalesced with this one
+		uniqueKey := name + "/" + hex.EncodeToString(digest[:8])
+		registrations = append(registrations, registerKind.New(payload, &jobs.EnqueueOptions{UniqueKey: uniqueKey}))
 	}
 	if err := b.store.Enqueue(ctx, registrations...); err != nil {
 		return fmt.Errorf("events: enqueue the registrations: %w", err)
 	}
 	return nil
+}
+
+// registration is the payload of the registration job at publisher, its set sorted by name.
+func (b *Bus) registration(publisher string) registrationPayload {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+	payload := registrationPayload{Publisher: publisher, InboxURL: b.inboxURL, InboxKeyID: inboxKeyID(b.inboxKey), Subscriptions: []declaredSubscription{}}
+	for _, declared := range b.subscriptions {
+		if declared.publisher == publisher {
+			payload.Subscriptions = append(payload.Subscriptions, declaredSubscription{Name: declared.name, Topic: declared.topic})
+		}
+	}
+	slices.SortFunc(payload.Subscriptions, func(left, right declaredSubscription) int { return strings.Compare(left.Name, right.Name) })
+	return payload
 }
 
 func (b *Bus) localSubscriptions() []Subscription {
