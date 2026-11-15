@@ -80,7 +80,7 @@ type Options struct {
 	// same as postgresadapter.Options.Propagators, e.g. jobs/oteladapter.NewPropagator().
 	Propagators []jobs.Propagator
 	Observer    Observer         // nil reports nothing
-	Now         func() time.Time // the inbox's clock for signature timestamps; nil is time.Now
+	Now         func() time.Time // the clock of signature timestamps, signing and verifying; nil is time.Now
 }
 
 // minimumInboxKeyBytes keeps derived secrets as strong as their HMAC.
