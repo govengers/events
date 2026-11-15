@@ -343,6 +343,20 @@ func TestTheSweepScheduleRunsTheStoresSweep(t *testing.T) {
 	require.Empty(t, entries, "the delivery of %s was swept", id)
 }
 
+func TestOneSweepRunDeletesEveryBatchPastTheRetention(t *testing.T) {
+	ctx := context.Background()
+	orders := newService(t, "orders", nil)
+	_, err := orders.pool.Exec(ctx, `INSERT INTO govengers_event_deliveries (subscriber, subscription, event_id, topic, event, status, finished_at)
+		SELECT 'billing', 'create-invoice', 'event-' || n, 'orders.order-placed.v1', '{}', 'delivered', now() - interval '8 days'
+		FROM generate_series(1, 2500) n`)
+	require.NoError(t, err)
+	require.NoError(t, orders.store.Enqueue(ctx, events.SweepSchedule().Job))
+	require.Equal(t, 1, orders.drain(t))
+	var left int
+	require.NoError(t, orders.pool.QueryRow(ctx, "SELECT count(*) FROM govengers_event_deliveries").Scan(&left))
+	require.Zero(t, left, "three batches of at most 1000 in one run")
+}
+
 func TestDataThatDoesNotDecodeIsAPermanentFailure(t *testing.T) {
 	orders := newService(t, "orders", nil)
 	called := false

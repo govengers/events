@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -446,4 +447,31 @@ func TestSweepDeletesFinishedRowsPastTheirRetention(t *testing.T) {
 	deleted, err = store.Sweep(ctx, &events.SweepRequest{RetainDelivered: 1, Limit: 0})
 	require.NoError(t, err)
 	require.Zero(t, deleted)
+}
+
+func TestSweepSkipsADeliveryARedeliverHolds(t *testing.T) {
+	ctx := context.Background()
+	store, pool := newStore(t, nil)
+	require.NoError(t, store.PutSubscriptions(ctx, "billing", []events.Subscription{remote("create-invoice")}))
+	key := publishOne(t, store, pool)
+	record(t, store, key, events.DeliveryFailed, 0)
+	_, err := pool.Exec(ctx, "UPDATE govengers_event_deliveries SET finished_at = now() - interval '2 hours'")
+	require.NoError(t, err)
+
+	// a Redeliver in flight: the row is locked and turns pending when it commits
+	transaction, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = transaction.Rollback(ctx) }()
+	_, err = transaction.Exec(ctx, "UPDATE govengers_event_deliveries SET status = 'pending', finished_at = NULL")
+	require.NoError(t, err)
+	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	deleted, err := store.Sweep(bounded, &events.SweepRequest{RetainFailed: time.Hour, Limit: 10})
+	require.NoError(t, err, "the sweep does not wait for the lock")
+	require.Zero(t, deleted)
+	require.NoError(t, transaction.Commit(ctx))
+	deleted, err = store.Sweep(ctx, &events.SweepRequest{RetainFailed: time.Hour, Limit: 10})
+	require.NoError(t, err)
+	require.Zero(t, deleted, "a pending delivery is kept")
+	require.Equal(t, 1, count(t, pool, "govengers_event_deliveries"))
 }

@@ -346,7 +346,8 @@ func (b *Bus) localSubscriptions() []Subscription {
 }
 
 // SweepSchedule returns the schedule that deletes delivered deliveries after a week, failed
-// ones after a month and inbox keys after a week (E7), every hour. Add it to
+// ones after a month and inbox keys after a week (E7), every hour, in batches of 1000 rows per
+// table until none is left. Add it to
 // jobs.WorkerOptions.Schedules of the workers that consume Queue.
 func SweepSchedule() jobs.Schedule {
 	return jobs.Schedule{
@@ -361,9 +362,18 @@ func SweepSchedule() jobs.Schedule {
 	}
 }
 
+// sweep repeats the store's batches until nothing past its retention is left, so the retention
+// holds whatever the traffic.
 func (b *Bus) sweep(ctx context.Context, job *jobs.Job[SweepRequest]) error {
-	_, err := b.store.Sweep(ctx, &job.Payload)
-	return err
+	for {
+		deleted, err := b.store.Sweep(ctx, &job.Payload)
+		if err != nil || deleted == 0 {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 }
 
 func orDefault[T comparable](value, fallback T) T {

@@ -39,13 +39,18 @@ func (s *Store) Accept(ctx context.Context, acceptance *events.Acceptance) (bool
 	return accepted, err
 }
 
+// sweepDeliveries skips the rows a Redeliver holds and repeats the predicate on the deleted row,
+// so a delivery that turned pending since the selection stays.
 const sweepDeliveries = `
 DELETE FROM govengers_event_deliveries
 WHERE (subscriber, subscription, event_id) IN (
     SELECT subscriber, subscription, event_id FROM govengers_event_deliveries
     WHERE (status = 'delivered' AND finished_at < now() - make_interval(secs => $1))
        OR (status = 'failed' AND finished_at < now() - make_interval(secs => $2))
-    LIMIT $3)`
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED)
+  AND ((status = 'delivered' AND finished_at < now() - make_interval(secs => $1))
+       OR (status = 'failed' AND finished_at < now() - make_interval(secs => $2)))`
 
 const sweepInbox = `
 DELETE FROM govengers_event_inbox
