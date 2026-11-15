@@ -320,3 +320,15 @@ func TestAPanickingObserverIsDropped(t *testing.T) {
 	silent.Received(&events.Reception{})
 	silent.Registered(&events.Registration{})
 }
+
+func TestTheDefaultClientRefusesInternalAddressesForGood(t *testing.T) {
+	orders := newService(t, "orders", &serviceOptions{configure: func(options *events.Options) { options.HTTPClient = nil }})
+	require.NoError(t, orders.store.PutSubscriptions(context.Background(), "intruder", []events.Subscription{{
+		Name: "metadata", Topic: orderPlacedTopic.Name(), Endpoint: "http://169.254.169.254/latest/meta-data", Secret: events.NewSecret(),
+	}}))
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	require.Equal(t, 1, orders.drain(t))
+	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "intruder", Subscription: "metadata", EventID: id})
+	require.Equal(t, events.DeliveryFailed, entry.Status, "no retry")
+	require.Contains(t, entry.LastError, "blocked address")
+}

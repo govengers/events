@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/govengers/events/safehttp"
 	"github.com/govengers/jobs"
 )
 
@@ -78,7 +79,8 @@ func (b *Bus) send(ctx context.Context, delivery *OutboundDelivery) sendResult {
 	}
 	response, err := b.client.Do(request)
 	if err != nil {
-		return sendResult{err: fmt.Errorf("post to the subscriber: %w", err)}
+		// A refused address stays refused: retrying for a day only hides the misconfiguration.
+		return sendResult{err: fmt.Errorf("post to the subscriber: %w", err), permanent: errors.Is(err, safehttp.ErrBlockedAddress)}
 	}
 	defer func() { _ = response.Body.Close() }() // the answer's body carries nothing we keep
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, discardedResponseBytes))

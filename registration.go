@@ -128,6 +128,9 @@ func (b *Bus) acceptRegistration(writer http.ResponseWriter, request *http.Reque
 }
 
 func (b *Bus) storeRegistration(writer http.ResponseWriter, request *http.Request, registration *Registration) (int, error) {
+	if b.authorize == nil {
+		return http.StatusForbidden, errors.New("registrations are disabled: no Options.Authorize")
+	}
 	if err := ValidateName(registration.Subscriber); err != nil {
 		return http.StatusBadRequest, err
 	}
@@ -141,9 +144,6 @@ func (b *Bus) storeRegistration(writer http.ResponseWriter, request *http.Reques
 		return http.StatusBadRequest, err
 	}
 	registration.Subscriptions = len(subscriptions)
-	if b.authorize == nil {
-		return http.StatusForbidden, errors.New("registrations are disabled: no Options.Authorize")
-	}
 	if err := b.authorize(request, registration.Subscriber, topicsOf(subscriptions)); err != nil {
 		return http.StatusForbidden, err
 	}
