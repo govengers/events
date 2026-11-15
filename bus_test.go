@@ -409,9 +409,9 @@ func TestAnEventAtTheLimitReachesARemoteHandler(t *testing.T) {
 		options.Publishers = []events.Publisher{publisherOf(orders)}
 	}})
 	topic, event := largestEvent(t)
-	var handled atomic.Int32
+	var handled atomic.Int64
 	require.NoError(t, events.Subscribe(billing.bus, topic, func(_ context.Context, message *events.Message[[]int]) error {
-		handled.Store(int32(len(message.Data)))
+		handled.Store(int64(len(message.Data)))
 		return nil
 	}, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
 	require.NoError(t, billing.bus.Register(ctx))
@@ -423,7 +423,7 @@ func TestAnEventAtTheLimitReachesARemoteHandler(t *testing.T) {
 	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: ids[0]})
 	require.Equal(t, events.DeliveryDelivered, entry.Status, "the inbox took the bytes Publish checked: %s", entry.LastError)
 	require.Equal(t, 1, billing.drain(t))
-	require.Equal(t, int32((events.MaximumEventBytes-1024)/2), handled.Load())
+	require.Equal(t, int64((events.MaximumEventBytes-1024)/2), handled.Load())
 }
 
 func TestAnEventAtTheLimitReachesALocalHandler(t *testing.T) {
