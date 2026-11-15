@@ -7,6 +7,7 @@ gotestsum := "go run gotest.tools/gotestsum@v1.13.0"
 govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 coverage_threshold := "80"
 coverage_excluded := "/examples/|/test/|/internal/postgrestest/"
+e2e_inputs := "test/e2e"
 
 default:
     @just --list
@@ -14,6 +15,7 @@ default:
 # Vet and lint with the govengers baseline (.golangci.yml, copied from govengers/standards, LIB-005 checks enabled)
 lint:
     go vet ./...
+    go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
 
 # Unit tests of changed and affected packages; the Go test cache replays the rest (TST-014). Fails below the coverage threshold (TST-010)
@@ -27,9 +29,35 @@ test *flags:
 # Every unit test, uncached and shuffled: the nightly run and before a release (TST-014, TST-005)
 test-all: (test "-count=1" "-shuffle=on")
 
+# Reproducible service binaries of the shop example and the compiled suite: their hash says whether the suite has anything new to test (TST-015)
+e2e-build:
+    mkdir -p sandbox/e2e-build
+    go build -race -trimpath -buildvcs=false -o sandbox/e2e-build/ ./examples/shop/cmd/...
+    go test -c -race -tags e2e -trimpath -buildvcs=false -o sandbox/e2e-build/ ./test/e2e/
+
+# The end-to-end suite: the example's two services on two databases (TST-011), always
+test-e2e-all: e2e-build
+    mkdir -p sandbox
+    E2E_BINARIES={{justfile_directory()}}/sandbox/e2e-build {{gotestsum}} --format testname --jsonfile sandbox/e2e.json -- -race -tags e2e -trimpath -buildvcs=false -count=1 ./test/e2e/
+
+# The end-to-end suite, skipped when binaries, suite and inputs equal a green run (TST-015); keeps sandbox/e2e.json for CI badges
+test-e2e: e2e-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    key=$(find sandbox/e2e-build {{e2e_inputs}} -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-32)
+    passed="sandbox/e2e-passed/$key"
+    if [ -f "$passed/e2e.json" ]; then
+        echo "e2e skipped: binaries, suite and inputs equal the green run $key"
+        cp "$passed/e2e.json" sandbox/e2e.json
+        exit 0
+    fi
+    "{{just_executable()}}" test-e2e-all
+    mkdir -p "$passed"
+    cp sandbox/e2e.json "$passed/e2e.json"
+
 # Scan for known vulnerabilities in reachable code (TCH-008)
 vulncheck:
     {{govulncheck}} ./...
 
 # Everything CI runs on a change
-check: lint test vulncheck
+check: lint test test-e2e vulncheck
