@@ -120,4 +120,4 @@ func (g guardedObserver) Registered(registration *Registration) {
 	g.observer.Registered(registration)
 }
 
-func recoverObserver() { _ = recover() } //nolint:revive // the Observer contract: a panicking report is dropped
+func recoverObserver() { _ = recover() } // the Observer contract: a panicking report is dropped

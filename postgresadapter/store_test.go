@@ -417,8 +417,10 @@ func TestSweepDeletesFinishedRowsPastTheirRetention(t *testing.T) {
 	_, err := pool.Exec(ctx, "UPDATE govengers_event_deliveries SET finished_at = now() - interval '2 hours' WHERE status <> 'pending'")
 	require.NoError(t, err)
 	for _, id := range []string{"old", "new"} {
-		_, err := store.Accept(ctx, &events.Acceptance{Subscriber: "billing", Subscription: "create-invoice", EventID: id,
-			Job: jobs.NewKind[string]("events.billing.create-invoice", &jobs.KindOptions{Queue: "events.billing"}).New(id, nil)})
+		_, err := store.Accept(ctx, &events.Acceptance{
+			Subscriber: "billing", Subscription: "create-invoice", EventID: id,
+			Job: jobs.NewKind[string]("events.billing.create-invoice", &jobs.KindOptions{Queue: "events.billing"}).New(id, nil),
+		})
 		require.NoError(t, err)
 	}
 	_, err = pool.Exec(ctx, "UPDATE govengers_event_inbox SET received_at = now() - interval '2 hours' WHERE event_id = 'old'")

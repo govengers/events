@@ -68,7 +68,7 @@ func (b *Bus) accept(writer http.ResponseWriter, request *http.Request, receptio
 	ctx := request.Context()
 	carried := map[string]string{"traceparent": event.TraceParent, "tracestate": event.TraceState}
 	for _, propagator := range b.propagators {
-		ctx = propagator.Extract(ctx, carried)
+		ctx = propagator.Extract(ctx, carried) //nolint:fatcontext // one layer per propagator, bounded by the options
 	}
 	local := Subscription{Subscriber: b.name, Name: declared.name, Queue: declared.queue, MaximumAttempts: declared.maximumAttempts}
 	accepted, err := b.store.Accept(ctx, &Acceptance{

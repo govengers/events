@@ -20,8 +20,8 @@ func TestCheck(t *testing.T) {
 	private := &policy{allowPrivate: true}
 	allowlisted := &policy{allowPrivate: true, allowed: []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16"), netip.MustParsePrefix("203.0.113.0/24")}}
 	cases := []struct {
-		address                       string
-		strict, private, allowlisted  bool // allowed under each policy
+		address                      string
+		strict, private, allowlisted bool // allowed under each policy
 	}{
 		{"93.184.216.34", true, true, false},
 		{"2606:2800:220:1::1", true, true, false},

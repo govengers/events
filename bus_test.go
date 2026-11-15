@@ -265,3 +265,58 @@ func TestARegistrationRetriesUntilThePublisherAnswers(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, billing.observer.registrations[0].StatusCode)
 	require.Equal(t, http.StatusNoContent, billing.observer.registrations[1].StatusCode)
 }
+
+func TestTheSweepScheduleRunsTheStoresSweep(t *testing.T) {
+	orders, _, _ := remotePair(t, nil)
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	require.Equal(t, 1, orders.drain(t))
+	_, err := orders.pool.Exec(context.Background(), "UPDATE govengers_event_deliveries SET finished_at = now() - interval '8 days'")
+	require.NoError(t, err)
+
+	schedule := events.SweepSchedule()
+	require.Equal(t, "govengers.events.sweep", schedule.Name)
+	require.NoError(t, orders.store.Enqueue(context.Background(), schedule.Job))
+	require.Equal(t, 1, orders.drain(t))
+	entries, err := orders.store.Deliveries(context.Background(), nil)
+	require.NoError(t, err)
+	require.Empty(t, entries, "the delivery of %s was swept", id)
+}
+
+func TestDataThatDoesNotDecodeIsAPermanentFailure(t *testing.T) {
+	orders := newService(t, "orders", nil)
+	called := false
+	require.NoError(t, events.Subscribe(orders.bus, orderPlacedTopic, func(context.Context, *events.Message[OrderPlaced]) error {
+		called = true
+		return nil
+	}, &events.SubscribeOptions{Name: "create-invoice"}))
+	require.NoError(t, orders.bus.Register(context.Background()))
+	_, err := orders.store.Publish(context.Background(), orders.pool, events.NewTopic[string](orderPlacedTopic.Name()).New("not an object"))
+	require.NoError(t, err)
+	require.Equal(t, 1, orders.drain(t))
+	require.False(t, called)
+	var status string
+	require.NoError(t, orders.pool.QueryRow(context.Background(), "SELECT status FROM govengers_jobs").Scan(&status))
+	require.Equal(t, "dead", status)
+}
+
+type panickingObserver struct{}
+
+func (panickingObserver) Published(*events.Publication)            { panic("observer bug") }
+func (panickingObserver) DeliveryFinished(*events.DeliveryAttempt) { panic("observer bug") }
+func (panickingObserver) Received(*events.Reception)               { panic("observer bug") }
+func (panickingObserver) Registered(*events.Registration)          { panic("observer bug") }
+
+func TestAPanickingObserverIsDropped(t *testing.T) {
+	observer := events.GuardObserver(panickingObserver{})
+	require.NotPanics(t, func() {
+		observer.Published(&events.Publication{})
+		observer.DeliveryFinished(&events.DeliveryAttempt{})
+		observer.Received(&events.Reception{})
+		observer.Registered(&events.Registration{})
+	})
+	silent := events.GuardObserver(nil)
+	silent.Published(&events.Publication{})
+	silent.DeliveryFinished(&events.DeliveryAttempt{})
+	silent.Received(&events.Reception{})
+	silent.Registered(&events.Registration{})
+}
