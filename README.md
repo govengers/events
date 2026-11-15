@@ -38,17 +38,20 @@ var OrderPlacedTopic = events.NewTopic[OrderPlaced]("orders.order-placed.v1")
 // main of every service: one store, one worker, one bus.
 jobStore, err := jobspostgres.New(&jobspostgres.Options{Pool: pool})
 eventStore, err := postgresadapter.New(&postgresadapter.Options{
-    Pool: pool, Jobs: jobStore, Source: "orders", Sealer: sealKeyRing, // govengers/auth seal
+    Pool: pool, Jobs: jobStore, Source: "orders", Sealer: sealer, // govengers/auth's seal key ring in a wrapper, docs/wiki/Security.md
 })
 worker, err := jobs.NewWorker(&jobs.WorkerOptions{
-    Store:     jobStore,
-    Queues:    map[string]jobs.QueueOptions{events.Queue: {}, events.SubscriberQueue("orders"): {}},
+    Store: jobStore,
+    Queues: map[string]jobs.QueueOptions{
+        events.Queue:                   {Concurrency: 8}, // deliveries, registrations, the sweep; a slow subscriber holds a slot per attempt
+        events.SubscriberQueue("orders"): {},
+    },
     Schedules: []jobs.Schedule{events.SweepSchedule()},
 })
 bus, err := events.New(&events.Options{
     Name: "orders", Store: eventStore, Worker: worker,
     HTTPClient: deliveries, // safehttp.New(&safehttp.Options{AllowPrivateNetworks: true}) inside a cluster
-    Authorize:  mayRegister, // which subscriber may register which topics
+    Authorize:  mayRegister, // which subscriber may register which topics and endpoints
 })
 router.PUT("/events/subscribers/:subscriber", apiKeyMiddleware, gin.WrapH(bus.RegistrationHandler()))
 ```

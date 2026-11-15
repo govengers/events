@@ -29,9 +29,10 @@ func ValidateName(name string) error {
 	return nil
 }
 
-// Sealer encrypts subscription secrets at rest. The method set matches the seal package of
-// github.com/govengers/auth, so its key ring can be passed in directly. associatedData binds a
-// sealed value to its row: Open fails for a value moved to another subscription.
+// Sealer encrypts subscription secrets at rest. associatedData binds a sealed value to its row:
+// Open fails for a value moved to another subscription. The seal package of
+// github.com/govengers/auth has another method set (a struct of associated data, a text value);
+// wrap its key ring in the ten lines docs/wiki/Security.md shows.
 type Sealer interface {
 	Seal(plaintext, associatedData []byte) ([]byte, error)
 	Open(sealed, associatedData []byte) ([]byte, error)

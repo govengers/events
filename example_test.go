@@ -37,7 +37,7 @@ func ExampleSign() {
 func ExampleNew() {
 	ctx := context.Background()
 	var pool *pgxpool.Pool   // the service's database, both MigrationV1 applied by goose
-	var sealer events.Sealer // the key ring of govengers/auth's seal package
+	var sealer events.Sealer // govengers/auth's seal key ring in a wrapper (docs/wiki/Security.md)
 	jobStore, _ := jobspostgres.New(&jobspostgres.Options{Pool: pool})
 	eventStore, _ := postgresadapter.New(&postgresadapter.Options{Pool: pool, Jobs: jobStore, Source: "billing", Sealer: sealer})
 	worker, _ := jobs.NewWorker(&jobs.WorkerOptions{

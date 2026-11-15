@@ -39,8 +39,9 @@ type Options struct {
 	Jobs *jobspostgres.Store // required; enqueues the handler, delivery and registration jobs
 	// Source is the CloudEvents source of published events: this service's name. Required to Publish.
 	Source string
-	// Sealer encrypts remote subscriptions' secrets at rest (the seal package of
-	// govengers/auth fits). Required as soon as a remote subscription is stored or delivered.
+	// Sealer encrypts remote subscriptions' secrets at rest (govengers/auth's seal package
+	// through a small wrapper, see events.Sealer). Required as soon as a remote subscription is
+	// stored or delivered.
 	Sealer events.Sealer
 	// Propagators write the trace context of the publishing context into the event's
 	// traceparent and tracestate extensions (jobs/oteladapter.NewPropagator()).

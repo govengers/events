@@ -130,8 +130,8 @@ func Serve(ctx context.Context, address string, handler http.Handler) error {
 	return nil
 }
 
-// Sealer seals secrets with AES-256-GCM. Simplification: a real service uses the key ring of
-// govengers/auth's seal package, which rotates keys.
+// Sealer seals secrets with AES-256-GCM. Simplification: a real service wraps the key ring of
+// govengers/auth's seal package, which rotates keys (docs/wiki/Security.md).
 type Sealer struct{ aead cipher.AEAD }
 
 // NewSealer reads a 32-byte key in hex.

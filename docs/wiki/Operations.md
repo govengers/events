@@ -5,9 +5,9 @@
 | Operation | Use |
 |-----------|-----|
 | `Subscriptions(ctx, &SubscriptionFilter{Subscriber, Topic})` | list subscriptions with failure count and disabled state, never secrets |
-| `DisableSubscription`, `EnableSubscription` | stop and resume deliveries; enable resets the failure count |
+| `DisableSubscription`, `EnableSubscription` | stop and resume deliveries; enable resets the failure count; an admin-disabled subscription survives a registration without it |
 | `Deliveries(ctx, &DeliveryFilter{Subscriber, Subscription, Status, After, Limit})` | the ledger, newest event first; continue with `After` = the last entry's `Key` |
-| `Redeliver(ctx, key)` | send a delivery again whatever its status: attempts reset, job enqueued in the same transaction |
+| `Redeliver(ctx, key)` | send a delivery again whatever its status: attempts reset, next generation, its job enqueued in the same transaction; an older job of the delivery sends nothing |
 | `PutSubscriptions(ctx, subscriber, set)` | replace a subscriber's set; an application creates webhooks for external receivers with it |
 
 The library ships no UI; an application builds its admin view on these, usually as livewire reads and mutations.
@@ -25,7 +25,7 @@ Validate the URL with `events.ValidateEndpoint` first, deliver with a safehttp c
 
 ## Retention
 
-Add `events.SweepSchedule()` to the worker's schedules: hourly it deletes delivered deliveries older than 7 days, failed ones older than 30 days and inbox keys older than 7 days, 1000 rows per table and run. Pending deliveries are never swept.
+Add `events.SweepSchedule()` to the worker's schedules: hourly it deletes delivered deliveries older than 7 days, failed ones older than 30 days and inbox keys older than 7 days, in batches of 1000 rows per table until none is left, so the retention holds whatever the traffic. It skips rows a concurrent `Redeliver` holds. Pending deliveries are never swept; a delivery whose subscription is gone is recorded failed, so it does not stay pending.
 
 ## Metrics
 

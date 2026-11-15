@@ -8,7 +8,7 @@ A topic is the typed contract of one kind of fact, declared once in the publishe
 var OrderPlacedTopic = events.NewTopic[OrderPlaced]("orders.order-placed.v1")
 ```
 
-Names are lower-case, dot-separated and end in the major version (`ValidateTopic`). Within a version only additive changes: decoding is tolerant, a subscriber ignores fields it does not know. A breaking change publishes `.v2` next to `.v1` until every subscriber moved. Data carries references and a version, not documents: an encoded event is at most 256 KiB (`MaximumEventBytes`).
+Names are lower-case, dot-separated and end in the major version (`ValidateTopic`). Within a version only additive changes: decoding is tolerant, a subscriber ignores fields it does not know. A breaking change publishes `.v2` next to `.v1` until every subscriber moved. Data carries references and a version, not documents: an encoded event is at most 32 KiB (`MaximumEventBytes`): the handler's job carries it, and jobs caps a payload at 256 KiB of jsonb, which takes up to six times the JSON text. Data with a NUL character is refused (`ErrNulCharacter`), jsonb cannot store it.
 
 ## Publish
 
@@ -42,4 +42,4 @@ A removed `Subscribe` disappears at the publisher with the next registration. Ke
 
 ## The publisher's registration route
 
-`bus.RegistrationHandler()` replaces the subscriber's set in one transaction. Mount it behind the application's authentication; `Options.Authorize(request, subscriber, topics)` decides whether the caller may register that subscriber for those topics (with govengers/auth's apikey the identity is in the request's context). Without `Authorize` every registration is refused. Endpoints must be https unless `AllowHTTPEndpoints`.
+`bus.RegistrationHandler()` replaces the subscriber's set in one transaction. Mount it behind the application's authentication; `Options.Authorize(request, registration)` decides whether the caller may register that subscriber with those subscriptions: `registration.Subscriptions` carry name, topic and endpoint, no secret (with govengers/auth's apikey the identity is in the request's context). Without `Authorize` every registration is refused, and a registration naming the publisher itself always is. Endpoints must be https unless `AllowHTTP`.

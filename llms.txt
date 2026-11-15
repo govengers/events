@@ -5,7 +5,7 @@
 - Module: `github.com/govengers/events`, Go 1.26, PostgreSQL 18, Apache 2.0. Not released yet (v0).
 - Packages: `events` (Topic, Event, Message, Sign/Verify/NewSecret/DeriveSecret, Bus with InboxHandler/RegistrationHandler/Register, Subscribe, SweepSchedule, Store/Sealer/Observer interfaces), `postgresadapter` (Store: Publish, PutSubscriptions, Subscriptions, Disable/EnableSubscription, Deliveries, Redeliver, Accept, Sweep, MigrationV1), `safehttp` (New: dial-time address check, no proxy, bounded redirects and responses), `prometheusadapter` (Metrics implements Observer).
 - Standards: govengers/standards, `library` profile.
-- Rules of thumb: publish with the transaction of the change; handlers are jobs handlers and idempotent, delivery is at least once and unordered; the worker consumes `events.Queue` and `events.SubscriberQueue(name)`; inbox without auth (signature), registration behind auth plus Options.Authorize; inside a cluster give the Bus a safehttp client with AllowPrivateNetworks or AllowedNetworks.
+- Rules of thumb: publish with the transaction of the change; handlers are jobs handlers and idempotent, delivery is at least once and unordered; the worker consumes `events.Queue` (give it a concurrency, e.g. 8) and `events.SubscriberQueue(name)`; events are at most 32 KiB, references not documents, no NUL characters; inbox without auth (signature), registration behind auth plus Options.Authorize (sees subscriber, topics, endpoints); https everywhere unless Options.AllowHTTP; govengers/auth's seal key ring needs a ten-line wrapper to be an events.Sealer (docs/wiki/Security.md); inside a cluster give the Bus a safehttp client with AllowPrivateNetworks or AllowedNetworks.
 
 ## Docs
 
