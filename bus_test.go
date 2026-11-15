@@ -550,3 +550,30 @@ func TestANulCharacterIsRefusedBeforeTheFirstWrite(t *testing.T) {
 	_, err = orders.store.Publish(ctx, transaction, orderPlacedTopic.New(OrderPlaced{OrderID: `a\u0000b`}))
 	require.NoError(t, err, "the caller's transaction is intact, and the text \\u0000 is no NUL")
 }
+
+func TestDeliveriesDuringAnInboxKeyRotationRetryUntilTheNewSecretArrives(t *testing.T) {
+	ctx := context.Background()
+	orders, billing, invoices := remotePair(t, nil)
+	// the publisher still holds the secret of the old inbox key
+	require.NoError(t, orders.store.PutSubscriptions(ctx, "billing", []events.Subscription{{
+		Name: "create-invoice", Topic: orderPlacedTopic.Name(), Endpoint: billing.server.URL + "/events/create-invoice",
+		Secret: events.DeriveSecret([]byte("the-old-inbox-key-0123456789abcdef"), "create-invoice"),
+	}}))
+	ids := []string{}
+	for index := range events.DefaultDisableAfter {
+		ids = append(ids, orders.publish(t, OrderPlaced{OrderID: "o", Version: index}))
+	}
+	require.Equal(t, events.DefaultDisableAfter, orders.drain(t))
+	record := orders.subscription(t, "billing", "create-invoice")
+	require.Nil(t, record.DisabledAt, "a 401 does not count towards the auto-disable")
+	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: ids[0]})
+	require.Equal(t, events.DeliveryPending, entry.Status)
+	require.Equal(t, http.StatusUnauthorized, entry.LastStatusCode)
+
+	require.NoError(t, billing.bus.Register(ctx))
+	require.Equal(t, 1, billing.drain(t))
+	orders.makeDue(t)
+	require.Equal(t, events.DefaultDisableAfter, orders.drain(t))
+	require.Equal(t, events.DefaultDisableAfter, billing.drain(t))
+	require.Len(t, invoices.all(), events.DefaultDisableAfter)
+}
