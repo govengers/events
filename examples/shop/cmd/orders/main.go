@@ -66,8 +66,8 @@ func run() error {
 	mux.Handle("POST /orders", placeOrder(pool, components.Events))
 
 	group, ctx := errgroup.WithContext(ctx)
-	group.Go(func() error { return components.Worker.Run(ctx) })
-	group.Go(func() error { return platform.Serve(ctx, os.Getenv("LISTEN"), mux) })
+	group.Go(platform.Recovering(func() error { return components.Worker.Run(ctx) }))
+	group.Go(platform.Recovering(func() error { return platform.Serve(ctx, os.Getenv("LISTEN"), mux) }))
 	return group.Wait()
 }
 

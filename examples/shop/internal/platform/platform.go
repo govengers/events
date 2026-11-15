@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -80,7 +81,8 @@ func NewComponents(pool *pgxpool.Pool, service string) (*Components, error) {
 		Store: jobStore,
 		Name:  service,
 		Queues: map[string]jobs.QueueOptions{
-			events.Queue:                    {PollInterval: poll},
+			// one slow subscriber holds a slot for up to the client's timeout per attempt
+			events.Queue:                    {PollInterval: poll, Concurrency: 8},
 			events.SubscriberQueue(service): {PollInterval: poll},
 		},
 		Schedules: []jobs.Schedule{events.SweepSchedule()},
@@ -110,7 +112,7 @@ func Serve(ctx context.Context, address string, handler http.Handler) error {
 	}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(listener) }()
+	go func() { done <- Recovering(func() error { return server.Serve(listener) })() }()
 	fmt.Println("ready")
 	select {
 	case err := <-done:
@@ -163,6 +165,18 @@ func (s *Sealer) Open(sealed, associatedData []byte) ([]byte, error) {
 		return nil, errors.New("sealed value too short")
 	}
 	return s.aead.Open(nil, sealed[:size], sealed[size:], associatedData)
+}
+
+// Recovering turns a panic in work into an error for its errgroup or channel (CON-001).
+func Recovering(work func() error) func() error {
+	return func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = fmt.Errorf("panic: %v\n%s", recovered, debug.Stack())
+			}
+		}()
+		return work()
+	}
 }
 
 func orDefault(value, fallback string) string {
