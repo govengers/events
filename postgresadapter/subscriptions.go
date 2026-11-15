@@ -16,8 +16,11 @@ import (
 // once cannot deadlock on each other's row locks or interleave their deletes.
 const lockSubscriber = `SELECT pg_advisory_xact_lock(hashtext('govengers_event_subscriptions'), hashtext($1))`
 
+// deleteMissingSubscriptions keeps an administrator's disable: a subscriber that registers
+// without the subscription and then with it again gets it back disabled.
 const deleteMissingSubscriptions = `
-DELETE FROM govengers_event_subscriptions WHERE subscriber = $1 AND NOT (name = ANY($2))`
+DELETE FROM govengers_event_subscriptions
+WHERE subscriber = $1 AND NOT (name = ANY($2)) AND disabled_by IS DISTINCT FROM 'admin'`
 
 // upsertSubscription keeps an existing row's failure state, except that a subscription the
 // failures disabled is enabled again: a new registration is the subscriber's sign of life, and a
@@ -40,7 +43,8 @@ ON CONFLICT (subscriber, name) DO UPDATE SET
     updated_at = now()`
 
 // PutSubscriptions replaces the subscriber's subscriptions with the given set in one
-// transaction (E5). Every subscription is validated first: names (events.ErrInvalidName), topic
+// transaction (E5); a subscription an administrator disabled stays, disabled, when the set no
+// longer has it, until EnableSubscription. Every subscription is validated first: names (events.ErrInvalidName), topic
 // (events.ErrInvalidTopic), and for a remote one the endpoint (events.ErrInvalidEndpoint, https
 // or http) and the secret (events.ErrInvalidSecret); a local one needs a queue and a positive
 // MaximumAttempts. Remote secrets are sealed with Options.Sealer (ErrNoSealer without one). An
@@ -192,13 +196,14 @@ WHERE subscriber = $1 AND name = $2`
 
 // DisableSubscription stops deliveries to a subscription until EnableSubscription: Publish skips
 // it, and pending deliveries are recorded as failed without being sent. A registration does not
-// enable it again. It returns events.ErrNotFound for an unknown subscription.
+// enable it again, and one without it does not remove it. It returns events.ErrNotFound for an
+// unknown subscription.
 func (s *Store) DisableSubscription(ctx context.Context, subscriber, name string) error {
 	return s.updateSubscription(ctx, disableSubscription, "disable", subscriber, name)
 }
 
 // EnableSubscription enables a subscription disabled by failures or by DisableSubscription and
-// resets its failure count; events published while it was disabled stay undelivered, failed
+// resets its failure count (one its subscriber dropped meanwhile goes with the next registration); events published while it was disabled stay undelivered, failed
 // deliveries can be sent again with Redeliver. It returns events.ErrNotFound for an unknown
 // subscription.
 func (s *Store) EnableSubscription(ctx context.Context, subscriber, name string) error {

@@ -334,6 +334,17 @@ func TestARegistrationEnablesOnlyWhatFailuresDisabled(t *testing.T) {
 	require.Nil(t, records[0].DisabledAt)
 	require.Zero(t, records[0].FailedDeliveries)
 	require.Equal(t, "admin", records[1].DisabledBy)
+
+	// the subscriber cannot lift the administrator's disable by dropping and re-adding it
+	require.NoError(t, store.PutSubscriptions(ctx, "billing", nil))
+	require.Equal(t, []string{"send-receipt"}, names(t, store, "billing"))
+	require.NoError(t, store.PutSubscriptions(ctx, "billing", set))
+	records, err = store.Subscriptions(ctx, &postgresadapter.SubscriptionFilter{Topic: orderPlacedTopic.Name()})
+	require.NoError(t, err)
+	require.Equal(t, "admin", records[1].DisabledBy)
+	require.NoError(t, store.EnableSubscription(ctx, "billing", "send-receipt"))
+	require.NoError(t, store.PutSubscriptions(ctx, "billing", nil))
+	require.Empty(t, names(t, store, "billing"), "once enabled, the next registration removes it")
 }
 
 func TestAcceptEnqueuesOnceUnderConcurrency(t *testing.T) {
