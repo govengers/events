@@ -1,0 +1,21 @@
+# govengers/events
+
+> Publish and subscribe between govengers services on top of govengers/jobs: typed versioned topics, CloudEvents 1.0 envelope, publish inside the caller's transaction, local subscriptions (a job in the same database) and remote ones (a ledgered, Standard Webhooks signed POST to the subscriber's inbox, which verifies, deduplicates and enqueues a job), registration of a subscriber's set at the publisher, auto-disable, redelivery, an SSRF-safe HTTP client, sealed secrets, Prometheus metrics.
+
+- Module: `github.com/govengers/events`, Go 1.26, PostgreSQL 18, Apache 2.0. Not released yet (v0).
+- Packages: `events` (Topic, Event, Message, Sign/Verify/NewSecret/DeriveSecret, Bus with InboxHandler/RegistrationHandler/Register, Subscribe, SweepSchedule, Store/Sealer/Observer interfaces), `postgresadapter` (Store: Publish, PutSubscriptions, Subscriptions, Disable/EnableSubscription, Deliveries, Redeliver, Accept, Sweep, MigrationV1), `safehttp` (New: dial-time address check, no proxy, bounded redirects and responses), `prometheusadapter` (Metrics implements Observer).
+- Standards: govengers/standards, `library` profile.
+- Rules of thumb: publish with the transaction of the change; handlers are jobs handlers and idempotent, delivery is at least once and unordered; the worker consumes `events.Queue` and `events.SubscriberQueue(name)`; inbox without auth (signature), registration behind auth plus Options.Authorize; inside a cluster give the Bus a safehttp client with AllowPrivateNetworks or AllowedNetworks.
+
+## Docs
+
+- [README.md](README.md): overview, install, usage, packages.
+- [docs/wiki/Home.md](docs/wiki/Home.md): model, package map, wiring order in main.
+- [docs/wiki/Publish-and-Subscribe.md](docs/wiki/Publish-and-Subscribe.md): topics, Publish, Subscribe, Register, the registration route.
+- [docs/wiki/Delivery-and-Inbox.md](docs/wiki/Delivery-and-Inbox.md): ledger, outbound status mapping, auto-disable, inbox steps.
+- [docs/wiki/Security.md](docs/wiki/Security.md): signatures, secrets, safehttp table, identities.
+- [docs/wiki/Operations.md](docs/wiki/Operations.md): admin operations, application-created webhooks, retention, metrics, tracing.
+- [docs/wiki/Testing.md](docs/wiki/Testing.md): jobstest.Drain, two services in one test, making retries due.
+- [docs/wiki/Gotchas.md](docs/wiki/Gotchas.md): the rules that are easy to get wrong.
+- [docs/design.md](docs/design.md): the binding design, decisions E1-E11 (agreed with jobs) and E12 onwards.
+- [examples/shop](examples/shop): orders publishes, billing subscribes remotely; run by the end-to-end suite.
