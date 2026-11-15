@@ -215,6 +215,15 @@ func TestNewAndSubscribeValidate(t *testing.T) {
 	require.Error(t, err)
 	_, err = events.New(&events.Options{Name: "Orders", Store: orders.store, Worker: orders.worker})
 	require.ErrorIs(t, err, events.ErrInvalidName)
+	for name, options := range map[string]*events.Options{
+		"a scheme-less inbox URL": {InboxURL: "billing.example.com/events"},
+		"an http inbox URL":       {InboxURL: "http://billing.example.com/events"},
+		"an http publisher":       {Publishers: []events.Publisher{{Name: "orders", URL: "http://orders.example.com/events"}}},
+	} {
+		options.Name, options.Store, options.Worker = "billing", orders.store, orders.worker
+		_, err = events.New(options)
+		require.ErrorIs(t, err, events.ErrInvalidEndpoint, name)
+	}
 
 	invalid := map[string]*events.SubscribeOptions{
 		"no name":                   {},
