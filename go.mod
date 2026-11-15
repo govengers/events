@@ -9,6 +9,7 @@ require (
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/stretchr/testify v1.12.1
 	go.uber.org/goleak v1.3.0
+	golang.org/x/sync v0.24.0
 )
 
 require (
@@ -18,6 +19,5 @@ require (
 	github.com/lib/pq v1.10.9 // indirect
 	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 )
