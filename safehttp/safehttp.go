@@ -117,6 +117,7 @@ func (p *policy) control(_, address string, _ syscall.RawConn) error {
 var alwaysBlocked = []netip.Prefix{
 	netip.MustParsePrefix("169.254.0.0/16"),     // link-local, AWS/GCP/Azure metadata 169.254.169.254
 	netip.MustParsePrefix("100.100.100.200/32"), // Alibaba Cloud metadata
+	netip.MustParsePrefix("168.63.129.16/32"),   // Azure WireServer: public range, answers only inside a VM
 	netip.MustParsePrefix("fd00:ec2::254/128"),  // AWS metadata over IPv6
 	netip.MustParsePrefix("0.0.0.0/8"),          // "this network"
 	netip.MustParsePrefix("64:ff9b::/96"),       // NAT64
@@ -124,6 +125,7 @@ var alwaysBlocked = []netip.Prefix{
 	netip.MustParsePrefix("2002::/16"),          // 6to4
 	netip.MustParsePrefix("240.0.0.0/4"),        // reserved, incl. broadcast
 	netip.MustParsePrefix("::/96"),              // IPv4-compatible IPv6, deprecated
+	netip.MustParsePrefix("fec0::/10"),          // site-local IPv6, deprecated
 }
 
 // privateNetworks are refused unless AllowPrivateNetworks is set.

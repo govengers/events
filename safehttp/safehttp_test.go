@@ -40,6 +40,8 @@ func TestCheck(t *testing.T) {
 		{"fe80::1", false, false, false},
 		{"fd00:ec2::254", false, false, false},
 		{"100.100.100.200", false, false, false},
+		{"168.63.129.16", false, false, false},
+		{"fec0::1", false, false, false},
 		{"0.0.0.0", false, false, false},
 		{"::", false, false, false},
 		{"224.0.0.1", false, false, false},
