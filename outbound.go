@@ -25,33 +25,47 @@ const discardedResponseBytes = 64 << 10
 var errSubscriptionDisabled = errors.New("subscription disabled")
 
 // deliver is the handler of the outbound delivery job (E6): it POSTs the delivery's event to the
-// subscriber's inbox, signed per Standard Webhooks, and records the attempt in the ledger. A
-// delivery the ledger already holds as delivered is not sent again, so a job that runs twice
-// sends once unless the first run died between the POST and the record.
-func (b *Bus) deliver(ctx context.Context, job *jobs.Job[DeliveryKey]) error {
+// subscriber's inbox, signed per Standard Webhooks, and records the attempt in the ledger. Only a
+// pending delivery of the job's generation is sent, so a job that runs again after its delivery
+// was recorded, or an older job after a Redeliver, sends nothing; a job that runs twice sends
+// twice only when the first run died between the POST and the record.
+func (b *Bus) deliver(ctx context.Context, job *jobs.Job[deliveryPayload]) error {
 	started := time.Now()
-	attempt := &DeliveryAttempt{Key: job.Payload}
+	attempt := &DeliveryAttempt{Key: job.Payload.DeliveryKey}
 	defer func() {
 		attempt.Duration = time.Since(started)
 		b.observer.DeliveryFinished(attempt)
 	}()
-	delivery, err := b.store.Delivery(ctx, job.Payload)
-	if errors.Is(err, ErrNotFound) {
+	delivery, err := b.store.Delivery(ctx, job.Payload.DeliveryKey)
+	switch {
+	case errors.Is(err, ErrNotFound):
 		attempt.Result = DeliveryResultDropped
 		return nil
-	}
-	if err != nil {
+	case err != nil && job.Attempt >= job.MaximumAttempts:
+		// the last attempt: without a record the delivery would stay pending, unswept, for good
+		attempt.Result, attempt.Err = DeliveryResultFailed, err
+		_, recordErr := b.store.RecordDelivery(ctx, &DeliveryRecord{
+			Key: job.Payload.DeliveryKey, Generation: job.Payload.Generation, Status: DeliveryFailed, Error: err.Error(), Uncounted: true,
+		})
+		return jobs.Permanent(errors.Join(err, recordErr))
+	case err != nil:
 		attempt.Result, attempt.Err = DeliveryResultRetried, err
 		return err
 	}
 	attempt.Topic = delivery.Topic
 	switch {
-	case delivery.Status == DeliveryDelivered:
+	case delivery.Generation != job.Payload.Generation || delivery.Status != DeliveryPending:
 		attempt.Result = DeliveryResultDropped
 		return nil
-	case delivery.Disabled:
+	case delivery.Disabled || delivery.Obsolete != "":
+		reason := delivery.Obsolete
+		if reason == "" {
+			reason = errSubscriptionDisabled.Error()
+		}
 		attempt.Result = DeliveryResultSkipped
-		_, err := b.store.RecordDelivery(ctx, &DeliveryRecord{Key: delivery.Key, Status: DeliveryFailed, Error: errSubscriptionDisabled.Error()})
+		_, err := b.store.RecordDelivery(ctx, &DeliveryRecord{
+			Key: delivery.Key, Generation: delivery.Generation, Status: DeliveryFailed, Error: reason, Uncounted: true,
+		})
 		attempt.Err = err
 		return err
 	}
@@ -79,16 +93,19 @@ func (b *Bus) send(ctx context.Context, delivery *OutboundDelivery) sendResult {
 	}
 	response, err := b.client.Do(request)
 	if err != nil {
-		// A refused address stays refused: retrying for a day only hides the misconfiguration.
-		return sendResult{err: fmt.Errorf("post to the subscriber: %w", err), permanent: errors.Is(err, safehttp.ErrBlockedAddress)}
+		// A refused address and a redirect stay what they are: retrying for a day only hides the
+		// misconfiguration.
+		permanent := errors.Is(err, safehttp.ErrBlockedAddress) || errors.Is(err, safehttp.ErrTooManyRedirects)
+		return sendResult{err: fmt.Errorf("post to the subscriber: %w", err), permanent: permanent}
 	}
 	defer func() { _ = response.Body.Close() }() // the answer's body carries nothing we keep
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, discardedResponseBytes))
 	return classify(response)
 }
 
-// classify maps the subscriber's status to E6's outcome: 2xx delivered; 404 (mid-rollout), 408,
-// 429 and 5xx retry; every other status is permanent.
+// classify maps the subscriber's status to E6's outcome: 2xx delivered; 401 and 403 (an inbox
+// key rotation or a rollout: the secret reaches the publisher with the next registration), 404
+// (mid-rollout), 408, 429 and 5xx retry; every other status is permanent.
 func classify(response *http.Response) sendResult {
 	status := response.StatusCode
 	result := sendResult{statusCode: status}
@@ -97,7 +114,8 @@ func classify(response *http.Response) sendResult {
 		return result
 	case status == http.StatusTooManyRequests:
 		result.retryAfter = retryAfter(response.Header.Get("Retry-After"))
-	case status == http.StatusNotFound, status == http.StatusRequestTimeout, status >= 500:
+	case status == http.StatusUnauthorized, status == http.StatusForbidden, status == http.StatusNotFound,
+		status == http.StatusRequestTimeout, status >= 500:
 	default:
 		result.permanent = true
 	}
@@ -108,14 +126,17 @@ func classify(response *http.Response) sendResult {
 // retryAfter reads a Retry-After header in seconds; zero for none or a date (rare for 429).
 func retryAfter(header string) time.Duration {
 	seconds, err := strconv.Atoi(header)
-	if err != nil || seconds <= 0 {
+	switch {
+	case err != nil || seconds <= 0:
 		return 0
+	case seconds >= int(maximumRetryAfter/time.Second): // before the multiplication, which overflows
+		return maximumRetryAfter
 	}
-	return min(time.Duration(seconds)*time.Second, maximumRetryAfter)
+	return time.Duration(seconds) * time.Second
 }
 
 func (b *Bus) record(ctx context.Context, delivery *OutboundDelivery, response sendResult, final bool, attempt *DeliveryAttempt) error {
-	record := &DeliveryRecord{Key: delivery.Key, StatusCode: response.statusCode, DisableAfter: b.disableAfter}
+	record := &DeliveryRecord{Key: delivery.Key, Generation: delivery.Generation, StatusCode: response.statusCode, DisableAfter: b.disableAfter}
 	attempt.StatusCode, attempt.Err = response.statusCode, response.err
 	switch {
 	case response.err == nil:

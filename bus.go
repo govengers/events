@@ -33,7 +33,7 @@ const registrationAttempts = 100
 
 // The library's own job kinds.
 var (
-	deliverKind  = jobs.NewKind[DeliveryKey]("govengers.events.deliver", &jobs.KindOptions{Queue: Queue, MaximumAttempts: DeliveryAttempts})
+	deliverKind  = jobs.NewKind[deliveryPayload]("govengers.events.deliver", &jobs.KindOptions{Queue: Queue, MaximumAttempts: DeliveryAttempts})
 	registerKind = jobs.NewKind[registrationPayload]("govengers.events.register", &jobs.KindOptions{Queue: Queue, MaximumAttempts: registrationAttempts})
 	sweepKind    = jobs.NewKind[SweepRequest]("govengers.events.sweep", &jobs.KindOptions{Queue: Queue, MaximumAttempts: 3})
 )

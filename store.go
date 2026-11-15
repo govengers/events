@@ -76,25 +76,33 @@ const (
 
 // OutboundDelivery is what the outbound job needs to send one delivery.
 type OutboundDelivery struct {
-	Key      DeliveryKey
-	Topic    string
-	Body     []byte // the encoded Event
-	Endpoint string
-	Secret   string // opened
-	Status   DeliveryStatus
-	Attempts int  // attempts recorded so far
-	Disabled bool // the subscription is disabled: nothing is sent
+	Key        DeliveryKey
+	Generation int // counted up by every Redeliver; a job of another generation sends nothing
+	Topic      string
+	Body       []byte // the encoded Event
+	Endpoint   string
+	Secret     string // opened; empty unless the delivery is pending and can be sent
+	Status     DeliveryStatus
+	Attempts   int  // attempts recorded so far
+	Disabled   bool // the subscription is disabled: nothing is sent
+	// Obsolete says why the delivery cannot be sent any more: its subscription was removed, made
+	// local or subscribes another topic now. Empty while it can be sent.
+	Obsolete string
 }
 
 // DeliveryRecord is the result of one delivery attempt for the ledger.
 type DeliveryRecord struct {
 	Key        DeliveryKey
+	Generation int // the attempt's generation; a record of another generation changes nothing
 	Status     DeliveryStatus
 	StatusCode int    // the subscriber's HTTP status; zero for a transport error or no request
 	Error      string // empty when delivered
 	// DisableAfter disables the subscription once this many deliveries in a row failed; a
-	// delivered one resets the count. Only a transition to failed counts.
+	// delivered one resets the count. Only a transition from pending to failed counts.
 	DisableAfter int
+	// Uncounted keeps a failure out of the count: the subscriber did not cause it (the
+	// subscription is disabled or obsolete, or the delivery could not be loaded).
+	Uncounted bool
 }
 
 // RecordedDelivery is the ledger's state after RecordDelivery.
@@ -132,7 +140,8 @@ type Store interface {
 	// Accept stores the acceptance's key and enqueues its job in one transaction, and reports
 	// false without enqueuing when the key was stored before (a redelivery).
 	Accept(ctx context.Context, acceptance *Acceptance) (bool, error)
-	// Delivery loads a delivery with its subscription; ErrNotFound when either is gone.
+	// Delivery loads a delivery with its subscription; ErrNotFound when the delivery is gone, and
+	// OutboundDelivery.Obsolete set when the subscription is.
 	Delivery(ctx context.Context, key DeliveryKey) (*OutboundDelivery, error)
 	// RecordDelivery stores the result of one attempt and updates the subscription's failure count.
 	RecordDelivery(ctx context.Context, record *DeliveryRecord) (*RecordedDelivery, error)
@@ -148,8 +157,15 @@ func (s *Subscription) Job(event *Event) *jobs.PreparedJob {
 	return kind.New(*event, nil)
 }
 
-// DeliveryJob prepares the outbound job of one delivery. Its unique key coalesces a redelivery
-// with a pending job of the same delivery.
-func DeliveryJob(key DeliveryKey) *jobs.PreparedJob {
-	return deliverKind.New(key, &jobs.EnqueueOptions{UniqueKey: key.Subscriber + "/" + key.Subscription + "/" + key.EventID})
+// deliveryPayload is the outbound job's payload: the delivery and the generation the job sends.
+type deliveryPayload struct {
+	DeliveryKey
+	Generation int `json:"generation"`
+}
+
+// DeliveryJob prepares the outbound job of one generation of a delivery: Publish enqueues
+// generation 0, Redeliver the next one. A job of an older generation sends nothing.
+func DeliveryJob(key DeliveryKey, generation int) *jobs.PreparedJob {
+	uniqueKey := fmt.Sprintf("%s/%s/%s/%d", key.Subscriber, key.Subscription, key.EventID, generation)
+	return deliverKind.New(deliveryPayload{DeliveryKey: key, Generation: generation}, &jobs.EnqueueOptions{UniqueKey: uniqueKey})
 }

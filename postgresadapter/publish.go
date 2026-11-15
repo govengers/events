@@ -121,7 +121,7 @@ func (s *Store) publishOne(ctx context.Context, executor Executor, envelope enve
 		if _, err := executor.Exec(ctx, insertDelivery, key.Subscriber, key.Subscription, key.EventID, topic, envelope.encoded); err != nil {
 			return wrapDriverError(err, "publish %s: record the delivery to %s/%s", topic, key.Subscriber, key.Subscription)
 		}
-		preparedJobs = append(preparedJobs, events.DeliveryJob(key))
+		preparedJobs = append(preparedJobs, events.DeliveryJob(key, 0))
 		publication.Remote++
 	}
 	if _, err := s.jobs.Enqueue(ctx, executor, preparedJobs...); err != nil {

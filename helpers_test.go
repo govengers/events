@@ -223,3 +223,16 @@ func (o *recordingObserver) receptionResults() []events.ReceptionResult {
 	}
 	return results
 }
+
+// statusCodes lists the subscriber's status of every delivery attempt that sent a request.
+func (o *recordingObserver) statusCodes() []int {
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	codes := []int{}
+	for _, attempt := range o.deliveries {
+		if attempt.StatusCode != 0 {
+			codes = append(codes, attempt.StatusCode)
+		}
+	}
+	return codes
+}

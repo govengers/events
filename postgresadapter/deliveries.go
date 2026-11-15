@@ -13,27 +13,38 @@ import (
 )
 
 const selectOutboundDelivery = `
-SELECT delivery.topic, delivery.event::text, delivery.status, delivery.attempts,
-       subscription.endpoint, subscription.sealed_secret, subscription.disabled_at IS NOT NULL
+SELECT delivery.topic, delivery.event, delivery.status, delivery.attempts, delivery.generation,
+       COALESCE(subscription.topic, ''), COALESCE(subscription.endpoint, ''), subscription.sealed_secret,
+       COALESCE(subscription.disabled_at IS NOT NULL, false)
 FROM govengers_event_deliveries delivery
-JOIN govengers_event_subscriptions subscription
+LEFT JOIN govengers_event_subscriptions subscription
   ON subscription.subscriber = delivery.subscriber AND subscription.name = delivery.subscription
-WHERE delivery.subscriber = $1 AND delivery.subscription = $2 AND delivery.event_id = $3
-  AND subscription.endpoint IS NOT NULL`
+WHERE delivery.subscriber = $1 AND delivery.subscription = $2 AND delivery.event_id = $3`
 
-// Delivery loads a delivery with its subscription's endpoint and opened secret. It returns
-// events.ErrNotFound when the delivery was swept or its subscription removed or made local.
+// Delivery loads a delivery with its subscription's endpoint and, when it can be sent, the opened
+// secret. It returns events.ErrNotFound when the delivery was swept, and sets Obsolete when its
+// subscription was removed, made local or subscribes another topic now.
 func (s *Store) Delivery(ctx context.Context, key events.DeliveryKey) (*events.OutboundDelivery, error) {
 	delivery := &events.OutboundDelivery{Key: key}
-	var body string
+	var subscriptionTopic string
 	var sealed []byte
 	err := s.pool.QueryRow(ctx, selectOutboundDelivery, key.Subscriber, key.Subscription, key.EventID).Scan(
-		&delivery.Topic, &body, &delivery.Status, &delivery.Attempts, &delivery.Endpoint, &sealed, &delivery.Disabled)
+		&delivery.Topic, &delivery.Body, &delivery.Status, &delivery.Attempts, &delivery.Generation,
+		&subscriptionTopic, &delivery.Endpoint, &sealed, &delivery.Disabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("delivery %s: %w", describe(key), events.ErrNotFound)
 	}
 	if err != nil {
 		return nil, wrapDriverError(err, "load delivery %s", describe(key))
+	}
+	switch {
+	case delivery.Endpoint == "":
+		delivery.Obsolete = "the subscription was removed or made local"
+	case subscriptionTopic != delivery.Topic:
+		delivery.Obsolete = "the subscription subscribes " + subscriptionTopic + " now"
+	}
+	if delivery.Status != events.DeliveryPending || delivery.Disabled || delivery.Obsolete != "" {
+		return delivery, nil // nothing is sent: no secret needed
 	}
 	if s.sealer == nil {
 		return nil, ErrNoSealer
@@ -42,18 +53,21 @@ func (s *Store) Delivery(ctx context.Context, key events.DeliveryKey) (*events.O
 	if err != nil {
 		return nil, fmt.Errorf("open the secret of %s/%s: %w", key.Subscriber, key.Subscription, err)
 	}
-	delivery.Body, delivery.Secret = []byte(body), string(secret)
+	delivery.Secret = string(secret)
 	return delivery, nil
 }
 
-// recordAttempt never turns a delivered delivery back: a stale run of the job that failed after
-// another run delivered changes nothing.
+// recordAttempt records an attempt of the delivery's current generation. A pending delivery takes
+// any status; a failed one only delivered (a slow run that delivered after another run recorded
+// the failure); a delivered one nothing. It returns the status before, so only a transition
+// counts.
 const recordAttempt = `
 UPDATE govengers_event_deliveries
 SET status = $4, attempts = attempts + 1, last_status_code = NULLIF($5, 0), last_error = NULLIF($6, ''),
     updated_at = now(), finished_at = CASE WHEN $4 = 'pending' THEN NULL ELSE now() END
-WHERE subscriber = $1 AND subscription = $2 AND event_id = $3 AND (status <> 'delivered' OR $4 = 'delivered')
-RETURNING attempts`
+WHERE subscriber = $1 AND subscription = $2 AND event_id = $3 AND generation = $7
+  AND (status = 'pending' OR (status = 'failed' AND $4 = 'delivered'))
+RETURNING attempts, old.status`
 
 const resetFailures = `
 UPDATE govengers_event_subscriptions SET failed_deliveries = 0, updated_at = now()
@@ -71,30 +85,32 @@ WHERE subscriber = $1 AND name = $2 AND disabled_at IS NULL
 RETURNING disabled_at IS NOT NULL`
 
 // RecordDelivery stores one attempt's result in the ledger and, in the same transaction,
-// updates the subscription: a delivered delivery resets its failure count, a failed one counts
-// and disables the subscription after record.DisableAfter failures in a row. A delivery that is
-// gone, or delivered before while this record is not, records nothing and reports zero attempts.
+// updates the subscription: a delivered delivery resets its failure count, a delivery that turns
+// failed counts (unless record.Uncounted) and disables the subscription after
+// record.DisableAfter failures in a row. A record of another generation, of a delivery that is
+// gone or finished before (except failed turning delivered) records nothing and reports zero
+// attempts.
 func (s *Store) RecordDelivery(ctx context.Context, record *events.DeliveryRecord) (*events.RecordedDelivery, error) {
 	key := record.Key
 	recorded := &events.RecordedDelivery{}
 	err := s.inTransaction(ctx, func(transaction pgx.Tx) error {
+		var before events.DeliveryStatus
 		err := transaction.QueryRow(ctx, recordAttempt, key.Subscriber, key.Subscription, key.EventID,
-			string(record.Status), record.StatusCode, record.Error).Scan(&recorded.Attempts)
+			string(record.Status), record.StatusCode, record.Error, record.Generation).Scan(&recorded.Attempts, &before)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
 		if err != nil {
 			return wrapDriverError(err, "record delivery %s", describe(key))
 		}
-		switch record.Status {
-		case events.DeliveryDelivered:
+		switch {
+		case record.Status == events.DeliveryDelivered:
 			_, err = transaction.Exec(ctx, resetFailures, key.Subscriber, key.Subscription)
-		case events.DeliveryFailed:
+		case record.Status == events.DeliveryFailed && before == events.DeliveryPending && !record.Uncounted:
 			err = transaction.QueryRow(ctx, countFailure, key.Subscriber, key.Subscription, record.DisableAfter).Scan(&recorded.Disabled)
 			if errors.Is(err, pgx.ErrNoRows) {
 				err = nil // disabled already, or gone
 			}
-		case events.DeliveryPending:
 		}
 		return wrapDriverError(err, "record delivery %s: update the subscription", describe(key))
 	})
@@ -164,8 +180,10 @@ func (s *Store) Deliveries(ctx context.Context, filter *DeliveryFilter) ([]*Deli
 	}
 	entries, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*DeliveryEntry, error) {
 		var entry DeliveryEntry
-		err := row.Scan(&entry.Key.Subscriber, &entry.Key.Subscription, &entry.Key.EventID, &entry.Topic, &entry.Event,
+		var event []byte
+		err := row.Scan(&entry.Key.Subscriber, &entry.Key.Subscription, &entry.Key.EventID, &entry.Topic, &event,
 			&entry.Status, &entry.Attempts, &entry.LastStatusCode, &entry.LastError, &entry.CreatedAt, &entry.UpdatedAt, &entry.FinishedAt)
+		entry.Event = event
 		return &entry, err
 	})
 	return entries, wrapDriverError(err, "list deliveries")
@@ -173,23 +191,27 @@ func (s *Store) Deliveries(ctx context.Context, filter *DeliveryFilter) ([]*Deli
 
 const resetDelivery = `
 UPDATE govengers_event_deliveries
-SET status = 'pending', attempts = 0, last_status_code = NULL, last_error = NULL, updated_at = now(), finished_at = NULL
-WHERE subscriber = $1 AND subscription = $2 AND event_id = $3`
+SET status = 'pending', attempts = 0, generation = generation + 1, last_status_code = NULL, last_error = NULL,
+    updated_at = now(), finished_at = NULL
+WHERE subscriber = $1 AND subscription = $2 AND event_id = $3
+RETURNING generation`
 
 // Redeliver sends a delivery again, whatever its status: it resets the ledger entry to pending
-// with no attempts and enqueues its outbound job, in one transaction. A pending outbound job of
-// the same delivery is reused instead of a second one. It returns events.ErrNotFound for an
-// unknown delivery. A delivery to a disabled subscription fails again until it is enabled.
+// with no attempts and the next generation and enqueues that generation's outbound job, in one
+// transaction. An earlier job of the delivery that still waits for its backoff sends nothing when
+// it runs, so one delivery has one sending job. It returns events.ErrNotFound for an unknown
+// delivery. A delivery to a disabled subscription fails again until it is enabled.
 func (s *Store) Redeliver(ctx context.Context, key events.DeliveryKey) error {
 	return s.inTransaction(ctx, func(transaction pgx.Tx) error {
-		tag, err := transaction.Exec(ctx, resetDelivery, key.Subscriber, key.Subscription, key.EventID)
+		var generation int
+		err := transaction.QueryRow(ctx, resetDelivery, key.Subscriber, key.Subscription, key.EventID).Scan(&generation)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("redeliver %s: %w", describe(key), events.ErrNotFound)
+		}
 		if err != nil {
 			return wrapDriverError(err, "redeliver %s", describe(key))
 		}
-		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("redeliver %s: %w", describe(key), events.ErrNotFound)
-		}
-		if _, err := s.jobs.Enqueue(ctx, transaction, events.DeliveryJob(key)); err != nil {
+		if _, err := s.jobs.Enqueue(ctx, transaction, events.DeliveryJob(key, generation)); err != nil {
 			return fmt.Errorf("redeliver %s: %w", describe(key), err)
 		}
 		return nil

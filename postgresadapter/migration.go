@@ -44,10 +44,14 @@ CREATE TABLE govengers_event_deliveries (
     subscription     text NOT NULL,
     event_id         text NOT NULL,
     topic            text NOT NULL,
-    event            jsonb NOT NULL,
+    -- the exact bytes Publish checked against MaximumEventBytes and every attempt sends
+    event            bytea NOT NULL,
     status           text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
     -- squawk-ignore prefer-bigint-over-int
     attempts         integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    -- Redeliver counts it up: only the outbound job of the current generation sends and records
+    -- squawk-ignore prefer-bigint-over-int
+    generation       integer NOT NULL DEFAULT 0 CHECK (generation >= 0),
     -- squawk-ignore prefer-bigint-over-int
     last_status_code integer,
     last_error       text,
@@ -60,6 +64,9 @@ CREATE TABLE govengers_event_deliveries (
 
 CREATE INDEX govengers_event_deliveries_finished ON govengers_event_deliveries (finished_at)
     WHERE status IN ('delivered', 'failed');
+
+-- the admin listing's order, newest event first, across subscribers
+CREATE INDEX govengers_event_deliveries_event ON govengers_event_deliveries (event_id, subscriber, subscription);
 
 CREATE TABLE govengers_event_inbox (
     subscriber   text NOT NULL,

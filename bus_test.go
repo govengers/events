@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -98,10 +99,10 @@ func TestADeliveredDeliveryIsNotSentAgainByASecondJob(t *testing.T) {
 	orders, billing, _ := remotePair(t, nil)
 	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
 	key := events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id}
-	require.NoError(t, orders.store.Enqueue(context.Background(), events.DeliveryJob(key)), "a second job of the same delivery")
+	require.NoError(t, orders.store.Enqueue(context.Background(), events.DeliveryJob(key, 0)), "a second job of the same delivery")
 	// the unique key coalesced the second job with the pending first one
 	require.Equal(t, 1, orders.drain(t))
-	require.NoError(t, orders.store.Enqueue(context.Background(), events.DeliveryJob(key)))
+	require.NoError(t, orders.store.Enqueue(context.Background(), events.DeliveryJob(key, 0)))
 	require.Equal(t, 1, orders.drain(t))
 	require.Equal(t, []events.DeliveryResult{events.DeliveryResultDelivered, events.DeliveryResultDropped}, orders.observer.deliveryResults())
 	require.Len(t, billing.observer.receptions, 1)
@@ -234,12 +235,72 @@ func TestAPendingDeliveryOfADisabledSubscriptionIsRecordedAsFailedUnsent(t *test
 	require.Equal(t, "admin", orders.subscription(t, "billing", "create-invoice").DisabledBy)
 }
 
-func TestADeliveryOfARemovedSubscriptionIsDropped(t *testing.T) {
+func TestADeliveryOfARemovedSubscriptionFailsUncountedAndIsSwept(t *testing.T) {
+	ctx := context.Background()
 	orders, _, _ := remotePair(t, nil)
-	orders.publish(t, OrderPlaced{OrderID: "o-1"})
-	require.NoError(t, orders.store.PutSubscriptions(context.Background(), "billing", nil))
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	require.NoError(t, orders.store.PutSubscriptions(ctx, "billing", nil))
 	require.Equal(t, 1, orders.drain(t))
-	require.Equal(t, []events.DeliveryResult{events.DeliveryResultDropped}, orders.observer.deliveryResults())
+	require.Equal(t, []events.DeliveryResult{events.DeliveryResultSkipped}, orders.observer.deliveryResults())
+	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id})
+	require.Equal(t, events.DeliveryFailed, entry.Status, "not pending for good")
+	require.Equal(t, "the subscription was removed or made local", entry.LastError)
+
+	_, err := orders.pool.Exec(ctx, "UPDATE govengers_event_deliveries SET finished_at = now() - interval '400 days'")
+	require.NoError(t, err)
+	deleted, err := orders.store.Sweep(ctx, &events.SweepRequest{RetainFailed: time.Hour, Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, 1, deleted)
+}
+
+func TestATopicChangeFailsPendingDeliveriesWithoutCountingThem(t *testing.T) {
+	ctx := context.Background()
+	orders, billing, _ := remotePair(t, nil)
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	require.NoError(t, orders.store.PutSubscriptions(ctx, "billing", []events.Subscription{{
+		Name: "create-invoice", Topic: "orders.order-placed.v2", Endpoint: billing.server.URL + "/events/create-invoice",
+		Secret: events.DeriveSecret(inboxKey, "create-invoice"),
+	}}))
+	require.Equal(t, 1, orders.drain(t))
+	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id})
+	require.Equal(t, events.DeliveryFailed, entry.Status)
+	require.Zero(t, entry.LastStatusCode, "nothing was sent")
+	require.Zero(t, orders.subscription(t, "billing", "create-invoice").FailedDeliveries)
+	require.Empty(t, billing.observer.receptions)
+}
+
+func TestARedeliveryDuringABackoffSendsOnceAndCountsOnce(t *testing.T) {
+	ctx := context.Background()
+	var status atomic.Int32
+	orders, _, _ := remotePair(t, switchable(&status))
+	status.Store(http.StatusServiceUnavailable)
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	key := events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id}
+	require.Equal(t, 1, orders.drain(t), "attempt 1 answered 503, the job waits for its backoff")
+	require.NoError(t, orders.store.Redeliver(ctx, key))
+	status.Store(http.StatusGone)
+	orders.makeDue(t)
+	require.Equal(t, 2, orders.drain(t), "the waiting job and the redelivery's job")
+	require.Equal(t, []int{503, 410}, orders.observer.statusCodes(), "the older generation sent nothing")
+	require.Equal(t, 1, orders.subscription(t, "billing", "create-invoice").FailedDeliveries)
+	entry := orders.delivery(t, key)
+	require.Equal(t, events.DeliveryFailed, entry.Status)
+	require.Equal(t, 1, entry.Attempts)
+}
+
+func TestAFailedDeliveryRunAgainIsNotSentOrCountedAgain(t *testing.T) {
+	ctx := context.Background()
+	var status atomic.Int32
+	orders, _, _ := remotePair(t, switchable(&status))
+	status.Store(http.StatusGone)
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	key := events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id}
+	require.Equal(t, 1, orders.drain(t))
+	// the worker died after the record: jobs runs the job of the same generation again
+	require.NoError(t, orders.store.Enqueue(ctx, events.DeliveryJob(key, 0)))
+	require.Equal(t, 1, orders.drain(t))
+	require.Equal(t, []int{410}, orders.observer.statusCodes())
+	require.Equal(t, 1, orders.subscription(t, "billing", "create-invoice").FailedDeliveries)
 }
 
 func TestARegistrationRetriesUntilThePublisherAnswers(t *testing.T) {
