@@ -26,6 +26,5 @@ jobs:
     uses: govengers/.github/.github/workflows/go-library.yml@v1
     with:
       full: ${{ github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v') }}
-      e2e: false # no end-to-end suite yet
     permissions:
       contents: write # the badges job pushes test and coverage badges to the badges branch
