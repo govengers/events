@@ -31,7 +31,7 @@ var orderPlacedTopic = events.NewTopic[OrderPlaced]("orders.order-placed.v1")
 
 var inboxKey = []byte("billing-inbox-key-0123456789abcdef")
 
-// service is one service of a test: its own database (a schema), job store, worker, bus and
+// service is one service of a test: its own database, job store, worker, bus and
 // HTTP server with the inbox under /events/ and the registration under /events/subscribers/.
 type service struct {
 	name     string

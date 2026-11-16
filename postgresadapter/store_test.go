@@ -33,7 +33,7 @@ func newStore(t *testing.T, adjust func(options *postgresadapter.Options)) (*pos
 	return storeOn(t, postgrestest.New(t), adjust)
 }
 
-// repeatableRead returns a second pool on the same schema whose transactions default to
+// repeatableRead returns a second pool on the same database whose transactions default to
 // REPEATABLE READ, the setting under which an unpinned multi-statement path breaks.
 func repeatableRead(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
