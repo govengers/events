@@ -51,7 +51,9 @@ func (e *PreparedEvent) Topic() string { return e.topic }
 
 // EncodeData returns the event's data as JSON. It fails with ErrInvalidTopic for a malformed topic
 // (also for a zero PreparedEvent), with the encoding error when the data cannot be encoded, and
-// with ErrNulCharacter for data with a NUL character.
+// with ErrNulCharacter for data with a NUL character. It does not check JSON that the data's type
+// passes through (json.RawMessage, json.Number): that must be storable as PostgreSQL jsonb, no
+// lone surrogate escape and no number outside numeric's range.
 func (e *PreparedEvent) EncodeData() (json.RawMessage, error) {
 	if err := ValidateTopic(e.topic); err != nil {
 		return nil, err

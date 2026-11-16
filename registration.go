@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"time"
 
 	"github.com/govengers/jobs"
 )
@@ -22,11 +23,13 @@ const maximumRegistrationBytes = 1 << 20
 // registrationPayload is the registration job's payload: the set Register computed, so whichever
 // replica claims the job sends the set of the code that enqueued it, also mid-rollout. It holds no
 // secret: the claiming process derives them, and only one with the same inbox key may.
+// RegisteredAt orders it at the publisher against other registrations (E31).
 type registrationPayload struct {
 	Publisher     string                 `json:"publisher"`
 	InboxURL      string                 `json:"inboxUrl"`
 	InboxKeyID    string                 `json:"inboxKeyId"`
 	Subscriptions []declaredSubscription `json:"subscriptions"`
+	RegisteredAt  time.Time              `json:"registeredAt"`
 }
 
 // declaredSubscription is one remote subscription of a registration job.
@@ -41,8 +44,11 @@ func inboxKeyID(key []byte) string {
 	return hex.EncodeToString(digest[:8])
 }
 
-// registrationBody is the body of PUT {publisher}/subscribers/{subscriber}.
+// registrationBody is the body of PUT {publisher}/subscribers/{subscriber}. The publisher
+// ignores a registration made before the one it stored last (E31); without RegisteredAt it is
+// not ordered.
 type registrationBody struct {
+	RegisteredAt  time.Time                `json:"registeredAt,omitzero"`
 	Subscriptions []registeredSubscription `json:"subscriptions"`
 }
 
@@ -62,7 +68,7 @@ func (b *Bus) register(ctx context.Context, job *jobs.Job[registrationPayload]) 
 		// a job of another version of this service, mid-rollout: a replica of that version claims a later attempt
 		return fmt.Errorf("the registration at %s needs a replica that declares the publisher and holds the job's inbox key", job.Payload.Publisher)
 	}
-	body := registrationBody{Subscriptions: b.registeredSubscriptions(&job.Payload)}
+	body := registrationBody{RegisteredAt: job.Payload.RegisteredAt, Subscriptions: b.registeredSubscriptions(&job.Payload)}
 	registration := &Registration{Publisher: publisher.Name, Subscriber: b.name, Subscriptions: len(body.Subscriptions)}
 	defer func() { b.observer.Registered(registration) }()
 	registration.StatusCode, registration.Err = b.sendRegistration(ctx, publisher, &body)
@@ -114,11 +120,12 @@ func (b *Bus) sendRegistration(ctx context.Context, publisher Publisher, body *r
 
 // RegistrationHandler returns the publisher's registration route (E5): PUT
 // {base}/subscribers/{subscriber} with the subscriber's complete set of subscriptions, which
-// replaces its earlier set in one transaction. The subscriber is the last segment of the request
-// path. Mount it behind the application's authentication (an API key, E8); Options.Authorize
-// then decides whether the caller may register that subscriber with those topics and endpoints,
-// and nil Authorize refuses everything. It answers 204 on success, 400 for an invalid set, 403
-// when refused or when the subscriber is this service itself.
+// replaces its earlier set in one transaction, unless the subscriber registered a newer set
+// before (E31). The subscriber is the last segment of the request path. Mount it behind the
+// application's authentication (an API key, E8); Options.Authorize then decides whether the
+// caller may register that subscriber with those topics and endpoints, and nil Authorize refuses
+// everything. It answers 204 on success and for a superseded registration, 400 for an invalid
+// set, 403 when refused or when the subscriber is this service itself.
 func (b *Bus) RegistrationHandler() http.Handler {
 	return http.HandlerFunc(b.acceptRegistration)
 }
@@ -167,9 +174,11 @@ func (b *Bus) storeRegistration(writer http.ResponseWriter, request *http.Reques
 	if err := b.authorize(request, authorizationRequest(registration.Subscriber, subscriptions)); err != nil {
 		return http.StatusForbidden, err
 	}
-	if err := b.store.PutSubscriptions(request.Context(), registration.Subscriber, subscriptions); err != nil {
+	applied, err := b.store.PutRegistration(request.Context(), registration.Subscriber, body.RegisteredAt, subscriptions)
+	if err != nil {
 		return http.StatusInternalServerError, err
 	}
+	registration.Superseded = !applied
 	return http.StatusNoContent, nil
 }
 

@@ -13,6 +13,11 @@ import (
 // ErrNotFound is returned by the store for a subscription or delivery that does not exist.
 var ErrNotFound = errors.New("events: not found")
 
+// ErrUnstorableEvent is returned by the store's Accept for an event that PostgreSQL's jsonb cannot
+// hold: a lone surrogate escape, a number outside numeric's range, invalid UTF-8. The inbox
+// answers 400, so the sender fails the delivery at once instead of retrying it.
+var ErrUnstorableEvent = errors.New("events: the event cannot be stored as jsonb")
+
 // ErrInvalidName is returned for a subscriber or subscription name that is not lower-case words
 // joined by dots or hyphens, or longer than 100 characters.
 var ErrInvalidName = errors.New("events: invalid name")
@@ -118,7 +123,10 @@ type Acceptance struct {
 	Subscriber   string
 	Subscription string
 	EventID      string
-	Job          *jobs.PreparedJob
+	// Event is the event as received; Accept fails with ErrUnstorableEvent when PostgreSQL's
+	// jsonb, which holds the handler's job, cannot store it.
+	Event []byte
+	Job   *jobs.PreparedJob
 }
 
 // SweepRequest asks the store to delete old ledger and inbox rows.
@@ -136,6 +144,11 @@ type Store interface {
 	// PutSubscriptions replaces the subscriber's subscriptions with the given set in one
 	// transaction (E5): new ones are added, changed ones updated, missing ones deleted.
 	PutSubscriptions(ctx context.Context, subscriber string, subscriptions []Subscription) error
+	// PutRegistration is PutSubscriptions for a subscriber's registration made at registeredAt
+	// (the subscriber's clock). It changes nothing and reports false when a registration made
+	// later was stored before, so a delayed or reordered registration cannot replace a newer
+	// set (E31). A zero registeredAt is not ordered.
+	PutRegistration(ctx context.Context, subscriber string, registeredAt time.Time, subscriptions []Subscription) (bool, error)
 	// Enqueue enqueues jobs outside any caller's transaction.
 	Enqueue(ctx context.Context, preparedJobs ...*jobs.PreparedJob) error
 	// Accept stores the acceptance's key and enqueues its job in one transaction, and reports

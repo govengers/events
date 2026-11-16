@@ -91,7 +91,7 @@ type Options struct {
 	// same as postgresadapter.Options.Propagators, e.g. jobs/oteladapter.NewPropagator().
 	Propagators []jobs.Propagator
 	Observer    Observer         // nil reports nothing
-	Now         func() time.Time // the clock of signature timestamps, signing and verifying; nil is time.Now
+	Now         func() time.Time // the clock of signature timestamps (signing and verifying) and of Register; nil is time.Now
 }
 
 // minimumInboxKeyBytes keeps derived secrets as strong as their HMAC.
@@ -329,7 +329,9 @@ func decodeMessage[P any](event *Event, topic string) (*Message[P], error) {
 // Register writes this service's local subscriptions into its own database and enqueues one
 // registration job per publisher, which sends that publisher the complete set of this
 // service's subscriptions to it (E5) and retries until the publisher answers. The job carries the
-// set (names and topics), so a replica of another version that claims it sends this set. Call it
+// set (names and topics), so a replica of another version that claims it sends this set, and the
+// time of this call (Options.Now), so the publisher ignores it once a later registration arrived
+// (E31): an older job that retries after a newer one cannot remove the newer set's subscriptions. Call it
 // at startup after the last Subscribe; it returns once the jobs are enqueued, so the service
 // starts while a publisher is down. A declared publisher without subscriptions gets the empty
 // set, which removes earlier ones.
@@ -337,15 +339,17 @@ func (b *Bus) Register(ctx context.Context) error {
 	if err := b.store.PutSubscriptions(ctx, b.name, b.localSubscriptions()); err != nil {
 		return fmt.Errorf("events: register the local subscriptions: %w", err)
 	}
+	registeredAt := b.now()
 	registrations := make([]*jobs.PreparedJob, 0, len(b.publishers))
 	for name := range b.publishers {
 		payload := b.registration(name)
-		encoded, err := json.Marshal(payload)
+		encoded, err := json.Marshal(payload) // before RegisteredAt: the same set coalesces with a pending job
 		if err != nil {
 			return fmt.Errorf("events: encode the registration at %s: %w", name, err)
 		}
 		digest := sha256.Sum256(encoded) // a pending job of another set is not coalesced with this one
 		uniqueKey := name + "/" + hex.EncodeToString(digest[:8])
+		payload.RegisteredAt = registeredAt
 		registrations = append(registrations, registerKind.New(payload, &jobs.EnqueueOptions{UniqueKey: uniqueKey}))
 	}
 	if err := b.store.Enqueue(ctx, registrations...); err != nil {

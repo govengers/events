@@ -182,6 +182,37 @@ func TestConcurrentPutsOfOneSubscriberEndWithOneOfTheSets(t *testing.T) {
 	require.Len(t, names(t, store, "billing"), 2)
 }
 
+func TestARegistrationMadeBeforeTheStoredOneChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newStore(t, nil)
+	newer := time.Now().Add(-time.Minute)
+	applied, err := store.PutRegistration(ctx, "billing", newer, []events.Subscription{remote("create-invoice"), remote("send-receipt")})
+	require.NoError(t, err)
+	require.True(t, applied)
+	applied, err = store.PutRegistration(ctx, "billing", newer.Add(-time.Second), []events.Subscription{remote("create-invoice")})
+	require.NoError(t, err)
+	require.False(t, applied, "an older job that retried after the newer one")
+	require.Equal(t, []string{"create-invoice", "send-receipt"}, names(t, store, "billing"))
+	applied, err = store.PutRegistration(ctx, "billing", newer, []events.Subscription{remote("create-invoice"), remote("send-receipt")})
+	require.NoError(t, err)
+	require.True(t, applied, "the same registration again: its response was lost")
+
+	// A replica whose clock runs a day ahead does not shut out the registrations after it.
+	_, err = store.PutRegistration(ctx, "billing", time.Now().Add(24*time.Hour), []events.Subscription{remote("create-invoice")})
+	require.NoError(t, err)
+	applied, err = store.PutRegistration(ctx, "billing", time.Now().Add(time.Second), []events.Subscription{remote("ship")})
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Equal(t, []string{"ship"}, names(t, store, "billing"))
+
+	// PutSubscriptions is not ordered and keeps the stored time.
+	require.NoError(t, store.PutSubscriptions(ctx, "billing", []events.Subscription{remote("audit")}))
+	applied, err = store.PutRegistration(ctx, "billing", newer, nil)
+	require.NoError(t, err)
+	require.False(t, applied)
+	require.Equal(t, []string{"audit"}, names(t, store, "billing"))
+}
+
 func TestPublishFansOutInTheCallersTransaction(t *testing.T) {
 	ctx := context.Background()
 	store, pool := newStore(t, func(options *postgresadapter.Options) {
@@ -355,7 +386,7 @@ func TestAcceptEnqueuesOnceUnderConcurrency(t *testing.T) {
 	var group errgroup.Group
 	for attempt := range 8 {
 		group.Go(func() error {
-			ok, err := store.Accept(ctx, &events.Acceptance{Subscriber: "billing", Subscription: "create-invoice", EventID: "e-1", Job: kind.New("e-1", nil)})
+			ok, err := store.Accept(ctx, &events.Acceptance{Subscriber: "billing", Subscription: "create-invoice", EventID: "e-1", Event: []byte(`{}`), Job: kind.New("e-1", nil)})
 			accepted.Store(attempt, ok)
 			return err
 		})
@@ -373,7 +404,7 @@ func TestAcceptEnqueuesOnceUnderConcurrency(t *testing.T) {
 	require.Equal(t, 1, count(t, pool, "govengers_event_inbox"))
 
 	failing := jobs.NewKind[string]("", nil) // an invalid kind fails the enqueue: the key rolls back with it
-	_, err := store.Accept(ctx, &events.Acceptance{Subscriber: "billing", Subscription: "create-invoice", EventID: "e-2", Job: failing.New("x", nil)})
+	_, err := store.Accept(ctx, &events.Acceptance{Subscriber: "billing", Subscription: "create-invoice", EventID: "e-2", Event: []byte(`{}`), Job: failing.New("x", nil)})
 	require.ErrorIs(t, err, jobs.ErrInvalidKind)
 	require.Equal(t, 1, count(t, pool, "govengers_event_inbox"))
 }
@@ -436,7 +467,7 @@ func TestSweepDeletesFinishedRowsPastTheirRetention(t *testing.T) {
 	require.NoError(t, err)
 	for _, id := range []string{"old", "new"} {
 		_, err := store.Accept(ctx, &events.Acceptance{
-			Subscriber: "billing", Subscription: "create-invoice", EventID: id,
+			Subscriber: "billing", Subscription: "create-invoice", EventID: id, Event: []byte(`{}`),
 			Job: jobs.NewKind[string]("events.billing.create-invoice", &jobs.KindOptions{Queue: "events.billing"}).New(id, nil),
 		})
 		require.NoError(t, err)

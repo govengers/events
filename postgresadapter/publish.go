@@ -31,7 +31,11 @@ VALUES ($1, $2, $3, $4, $5)`
 // subscriptions stores nothing. It returns the events' IDs in order.
 //
 // Every event is checked and encoded before the first write: events.ErrInvalidTopic, a value a
-// propagator cannot carry, data that does not encode and events.ErrEventTooLarge write nothing.
+// propagator cannot carry, data that does not encode, events.ErrNulCharacter and
+// events.ErrEventTooLarge write nothing. JSON a payload type passes through unchecked
+// (json.RawMessage, json.Number) must be storable as jsonb: a lone surrogate escape or a number
+// outside numeric's range fails the job insert of a local subscription, which aborts the
+// caller's transaction, and a remote subscriber's inbox refuses it (400, the delivery fails).
 // A database error after some writes returns the IDs published so far with the error; pass a
 // transaction for all or nothing.
 func (s *Store) Publish(ctx context.Context, executor Executor, preparedEvents ...*events.PreparedEvent) ([]string, error) {

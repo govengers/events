@@ -199,8 +199,10 @@ RETURNING generation`
 // Redeliver sends a delivery again, whatever its status: it resets the ledger entry to pending
 // with no attempts and the next generation and enqueues that generation's outbound job, in one
 // transaction. An earlier job of the delivery that still waits for its backoff sends nothing when
-// it runs, so one delivery has one sending job. It returns events.ErrNotFound for an unknown
-// delivery. A delivery to a disabled subscription fails again until it is enabled.
+// it runs, so one delivery has one sending job; an attempt already in flight finishes its request,
+// which carries the same webhook-id, so the subscriber's inbox runs the handler once (E33). It
+// returns events.ErrNotFound for an unknown delivery. A delivery to a disabled subscription fails
+// again until it is enabled.
 func (s *Store) Redeliver(ctx context.Context, key events.DeliveryKey) error {
 	return s.inTransaction(ctx, func(transaction pgx.Tx) error {
 		var generation int

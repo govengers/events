@@ -1,8 +1,8 @@
 package postgresadapter
 
-// MigrationV1 creates the events tables: subscriptions, the delivery ledger and the inbox. Run it
-// from one of the application's goose migrations, after jobs' postgresadapter.MigrationV1, in the
-// schema the store's pool uses:
+// MigrationV1 creates the events tables: subscriptions, the subscribers' registration times, the
+// delivery ledger and the inbox. Run it from one of the application's goose migrations, after
+// jobs' postgresadapter.MigrationV1, in the schema the store's pool uses:
 //
 //	-- +goose Up
 //	-- the content of postgresadapter.MigrationV1
@@ -38,6 +38,13 @@ CREATE TABLE govengers_event_subscriptions (
 
 CREATE INDEX govengers_event_subscriptions_topic ON govengers_event_subscriptions (topic)
     WHERE disabled_at IS NULL;
+
+-- the time of each subscriber's newest registration: an older one changes nothing (E31)
+CREATE TABLE govengers_event_subscribers (
+    subscriber    text PRIMARY KEY CHECK (subscriber <> ''),
+    registered_at timestamptz NOT NULL,
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE govengers_event_deliveries (
     subscriber       text NOT NULL,

@@ -4,30 +4,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/govengers/events"
 )
 
+// insertInbox casts the event to jsonb first: the handler's job holds it so, and an event jsonb
+// cannot store fails here with a data exception the inbox answers 400 to.
 const insertInbox = `
-INSERT INTO govengers_event_inbox (subscriber, subscription, event_id) VALUES ($1, $2, $3)
+INSERT INTO govengers_event_inbox (subscriber, subscription, event_id)
+SELECT $1, $2, $3 WHERE $4::jsonb IS NOT NULL
 ON CONFLICT DO NOTHING
 RETURNING true`
 
 // Accept stores the delivery's key in the inbox and enqueues its job in one READ COMMITTED
 // transaction (E7); a key stored before reports false and enqueues nothing. Two concurrent
 // requests of one delivery enqueue once: the second waits for the first's key and then finds it.
+// An event jsonb cannot store fails with events.ErrUnstorableEvent.
 func (s *Store) Accept(ctx context.Context, acceptance *events.Acceptance) (bool, error) {
 	accepted := false
 	err := s.inTransaction(ctx, func(transaction pgx.Tx) error {
 		var inserted bool
-		err := transaction.QueryRow(ctx, insertInbox, acceptance.Subscriber, acceptance.Subscription, acceptance.EventID).Scan(&inserted)
-		if errors.Is(err, pgx.ErrNoRows) {
+		err := transaction.QueryRow(ctx, insertInbox, acceptance.Subscriber, acceptance.Subscription, acceptance.EventID, string(acceptance.Event)).Scan(&inserted)
+		var driverError *pgconn.PgError
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
 			return nil
-		}
-		if err != nil {
+		case errors.As(err, &driverError) && strings.HasPrefix(driverError.Code, "22"): // class 22: data exception
+			return fmt.Errorf("accept %s/%s/%s: %w: %s", acceptance.Subscriber, acceptance.Subscription, acceptance.EventID, events.ErrUnstorableEvent, driverError.Message)
+		case err != nil:
 			return wrapDriverError(err, "accept %s/%s/%s", acceptance.Subscriber, acceptance.Subscription, acceptance.EventID)
 		}
 		if _, err := s.jobs.Enqueue(ctx, transaction, acceptance.Job); err != nil {

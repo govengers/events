@@ -3,6 +3,8 @@ package events_test
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/govengers/events"
 	"github.com/govengers/events/postgresadapter"
+	"github.com/govengers/events/safehttp"
 	"github.com/govengers/jobs"
 	"github.com/govengers/jobs/jobstest"
 	jobspostgres "github.com/govengers/jobs/postgresadapter"
@@ -576,4 +579,143 @@ func TestDeliveriesDuringAnInboxKeyRotationRetryUntilTheNewSecretArrives(t *test
 	require.Equal(t, events.DefaultDisableAfter, orders.drain(t))
 	require.Equal(t, events.DefaultDisableAfter, billing.drain(t))
 	require.Len(t, invoices.all(), events.DefaultDisableAfter)
+}
+
+func TestARedirectIsAPermanentFailure(t *testing.T) {
+	ctx := context.Background()
+	redirecting := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, "/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(redirecting.Close)
+	orders := newService(t, "orders", &serviceOptions{configure: func(options *events.Options) {
+		options.HTTPClient = redirecting.Client()
+		// what safehttp's client returns past its redirect limit
+		options.HTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error { return safehttp.ErrTooManyRedirects }
+	}})
+	require.NoError(t, orders.store.PutSubscriptions(ctx, "billing", []events.Subscription{{
+		Name: "create-invoice", Topic: orderPlacedTopic.Name(), Endpoint: redirecting.URL + "/events/create-invoice", Secret: events.NewSecret(),
+	}}))
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	require.Equal(t, 1, orders.drain(t))
+	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id})
+	require.Equal(t, events.DeliveryFailed, entry.Status, "no retry")
+	require.Equal(t, 1, entry.Attempts)
+	require.Contains(t, entry.LastError, safehttp.ErrTooManyRedirects.Error())
+}
+
+func TestADeliveryThatCannotBeLoadedAtItsLastAttemptFailsUncounted(t *testing.T) {
+	ctx := context.Background()
+	orders, billing, _ := remotePair(t, nil)
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	// the sealer's key is gone, and the job is at its last attempt
+	_, err := orders.pool.Exec(ctx, `UPDATE govengers_event_subscriptions SET sealed_secret = '\x00'`)
+	require.NoError(t, err)
+	_, err = orders.pool.Exec(ctx, `UPDATE govengers_jobs SET attempt = maximum_attempts - 1 WHERE status = 'pending'`)
+	require.NoError(t, err)
+	require.Equal(t, 1, orders.drain(t))
+	entry := orders.delivery(t, events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id})
+	require.Equal(t, events.DeliveryFailed, entry.Status, "not pending for good")
+	require.Contains(t, entry.LastError, "open the secret")
+	require.Zero(t, orders.subscription(t, "billing", "create-invoice").FailedDeliveries, "the subscriber did not cause it")
+	require.Empty(t, billing.observer.receptions)
+}
+
+func TestARedeliveryWhileAnAttemptIsInFlightRunsTheHandlerOnce(t *testing.T) {
+	ctx := context.Background()
+	arrived, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce) // before the servers close, also when the test fails early
+	var requests atomic.Int32
+	orders, billing, invoices := remotePair(t, &serviceOptions{intercept: func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if requests.Add(1) == 1 { // the first attempt hangs until the redelivery was sent
+				close(arrived)
+				<-release
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}})
+	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
+	key := events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id}
+	first := make(chan error, 1)
+	go func() {
+		_, err := orders.worker.RunDue(ctx)
+		first <- err
+	}()
+	<-arrived
+	require.NoError(t, orders.store.Redeliver(ctx, key))
+	_, replicaWorker := orders.replica(t, nil)
+	require.Equal(t, 1, jobstest.Drain(t, replicaWorker), "the redelivery's job sends while the first attempt hangs")
+	releaseOnce()
+	require.NoError(t, <-first)
+
+	require.Equal(t, 1, billing.drain(t), "the inbox enqueued the handler once")
+	require.Len(t, invoices.all(), 1)
+	require.Equal(t, []events.ReceptionResult{events.ReceptionAccepted, events.ReceptionDuplicate}, billing.observer.receptionResults())
+	entry := orders.delivery(t, key)
+	require.Equal(t, events.DeliveryDelivered, entry.Status)
+	require.Equal(t, 1, entry.Attempts, "the first attempt's record is of the older generation and changes nothing")
+	require.Zero(t, orders.subscription(t, "billing", "create-invoice").FailedDeliveries)
+}
+
+// pendingRegistrations counts the registration jobs that wait to run.
+func pendingRegistrations(t *testing.T, subscriber *service) int {
+	t.Helper()
+	var pending int
+	require.NoError(t, subscriber.pool.QueryRow(context.Background(),
+		"SELECT count(*) FROM govengers_jobs WHERE kind = 'govengers.events.register' AND status = 'pending'").Scan(&pending))
+	return pending
+}
+
+func TestTwoSetsRegisteredBeforeAnyRunEndWithTheNewerOneInEitherOrder(t *testing.T) {
+	ctx := context.Background()
+	orders := newService(t, "orders", nil)
+	old := newService(t, "billing", &serviceOptions{configure: func(options *events.Options) {
+		options.Publishers = []events.Publisher{publisherOf(orders)}
+		options.Now = func() time.Time { return time.Now().Add(-time.Minute) }
+	}})
+	var invoices received
+	require.NoError(t, events.Subscribe(old.bus, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, old.bus.Register(ctx))
+	next, _ := old.replica(t, func(options *events.Options) { options.Publishers = []events.Publisher{publisherOf(orders)} })
+	require.NoError(t, events.Subscribe(next, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, events.Subscribe(next, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "send-receipt", Publisher: "orders"}))
+	require.NoError(t, next.Register(ctx))
+	require.Equal(t, 2, pendingRegistrations(t, old), "the pending job of the older set did not swallow the newer set")
+
+	// the newer set's job runs first, the older one after it
+	_, err := old.pool.Exec(ctx, `UPDATE govengers_jobs SET run_at = run_at - interval '1 minute'
+		WHERE kind = 'govengers.events.register' AND payload @> '{"subscriptions":[{"name":"send-receipt"}]}'`)
+	require.NoError(t, err)
+	require.Equal(t, 2, old.drain(t))
+	require.Equal(t, []string{"create-invoice", "send-receipt"}, registeredNames(t, orders, "billing"))
+	require.Len(t, orders.observer.registrations, 2)
+	require.False(t, orders.observer.registrations[0].Superseded)
+	require.True(t, orders.observer.registrations[1].Superseded, "the older registration changed nothing")
+}
+
+func TestAnOlderRegistrationThatRetriesAfterANewerOneChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	var status atomic.Int32
+	status.Store(http.StatusServiceUnavailable)
+	orders := newService(t, "orders", switchable(&status))
+	old := newService(t, "billing", &serviceOptions{configure: func(options *events.Options) {
+		options.Publishers = []events.Publisher{publisherOf(orders)}
+	}})
+	var invoices received
+	require.NoError(t, events.Subscribe(old.bus, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, old.bus.Register(ctx), "an old pod starts while the publisher is down")
+	require.Equal(t, 1, old.drain(t), "503: the job waits for its backoff")
+
+	status.Store(0)
+	next, nextWorker := old.replica(t, func(options *events.Options) { options.Publishers = []events.Publisher{publisherOf(orders)} })
+	require.NoError(t, events.Subscribe(next, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "create-invoice", Publisher: "orders"}))
+	require.NoError(t, events.Subscribe(next, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: "send-receipt", Publisher: "orders"}))
+	require.NoError(t, next.Register(ctx), "the new release starts")
+	require.Equal(t, 1, jobstest.Drain(t, nextWorker))
+	require.Equal(t, []string{"create-invoice", "send-receipt"}, registeredNames(t, orders, "billing"))
+
+	old.makeDue(t)
+	require.Equal(t, 1, old.drain(t), "the old job's backoff ended")
+	require.Equal(t, []string{"create-invoice", "send-receipt"}, registeredNames(t, orders, "billing"))
 }

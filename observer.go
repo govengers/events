@@ -58,7 +58,7 @@ const (
 	ReceptionDuplicate           ReceptionResult = "duplicate"            // received before; answered 202, nothing enqueued
 	ReceptionUnknownSubscription ReceptionResult = "unknown_subscription" // 404
 	ReceptionInvalidSignature    ReceptionResult = "invalid_signature"    // 401
-	ReceptionInvalidEvent        ReceptionResult = "invalid_event"        // 400: not a CloudEvent, or of another topic
+	ReceptionInvalidEvent        ReceptionResult = "invalid_event"        // 400: not a CloudEvent, of another topic, or not storable as jsonb
 	ReceptionTooLarge            ReceptionResult = "too_large"            // 413
 	ReceptionFailed              ReceptionResult = "failed"               // 500: the store failed
 )
@@ -79,6 +79,8 @@ type Registration struct {
 	Inbound       bool // received from a subscriber, not sent to a publisher
 	StatusCode    int  // the answer's HTTP status
 	Err           error
+	// Superseded: received, and the subscriber registered a newer set before; nothing changed.
+	Superseded bool
 }
 
 // silentObserver is the Observer of a nil Options.Observer.

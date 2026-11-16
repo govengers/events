@@ -53,6 +53,11 @@ func TestTheInboxRefusesWhatItCannotTrust(t *testing.T) {
 	noID.ID = ""
 	oldVersion := validEvent()
 	oldVersion.SpecVersion = "0.3"
+	withData := func(data string) *events.Event {
+		event := validEvent()
+		event.Data = json.RawMessage(data)
+		return event
+	}
 	cases := map[string]struct {
 		request *http.Request
 		status  int
@@ -91,6 +96,10 @@ func TestTheInboxRefusesWhatItCannotTrust(t *testing.T) {
 		"an event of another topic":   {request: inboxRequest(t, secret, wrongTopic), status: http.StatusBadRequest, result: events.ReceptionInvalidEvent},
 		"an event without an id":      {request: inboxRequest(t, secret, noID), status: http.StatusBadRequest, result: events.ReceptionInvalidEvent},
 		"another CloudEvents version": {request: inboxRequest(t, secret, oldVersion), status: http.StatusBadRequest, result: events.ReceptionInvalidEvent},
+		// what jsonb, which holds the handler's job, cannot store: refused for good instead of a 500 per attempt
+		"a NUL character":                  {request: inboxRequest(t, secret, withData(`{"orderId":"\u0000"}`)), status: http.StatusBadRequest, result: events.ReceptionInvalidEvent},
+		"a lone surrogate":                 {request: inboxRequest(t, secret, withData(`{"orderId":"\ud83d"}`)), status: http.StatusBadRequest, result: events.ReceptionInvalidEvent},
+		"a number outside numeric's range": {request: inboxRequest(t, secret, withData(`{"orderId":"o-1","version":1e400000}`)), status: http.StatusBadRequest, result: events.ReceptionInvalidEvent},
 		"a body above the cap": {
 			request: func() *http.Request {
 				large := validEvent()

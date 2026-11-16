@@ -2,6 +2,7 @@ package postgresadapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -51,17 +52,46 @@ ON CONFLICT (subscriber, name) DO UPDATE SET
 // application creates its own webhooks for external receivers with it too, one subscriber per
 // owner of the webhooks.
 func (s *Store) PutSubscriptions(ctx context.Context, subscriber string, subscriptions []events.Subscription) error {
+	_, err := s.PutRegistration(ctx, subscriber, time.Time{}, subscriptions)
+	return err
+}
+
+// claimRegistration stores the time of the subscriber's newest registration and returns a row
+// unless a later one was stored before. A time ahead of the database's clock is stored as now(),
+// so a replica with a clock running ahead cannot shut out the registrations after it.
+const claimRegistration = `
+INSERT INTO govengers_event_subscribers AS stored (subscriber, registered_at) VALUES ($1, LEAST($2::timestamptz, now()))
+ON CONFLICT (subscriber) DO UPDATE SET registered_at = EXCLUDED.registered_at, updated_at = now()
+WHERE stored.registered_at <= $2::timestamptz
+RETURNING true`
+
+// PutRegistration is PutSubscriptions for a registration the subscriber made at registeredAt: it
+// changes nothing and reports false when the subscriber's stored registration is later (E31),
+// so an older registration job that retries after a newer one cannot replace the newer set. A
+// zero registeredAt is not ordered: it replaces the set and keeps the stored time.
+func (s *Store) PutRegistration(ctx context.Context, subscriber string, registeredAt time.Time, subscriptions []events.Subscription) (bool, error) {
 	rows, err := s.subscriptionRows(subscriber, subscriptions)
 	if err != nil {
-		return err
+		return false, err
 	}
 	names := make([]string, 0, len(rows))
 	for _, row := range rows {
 		names = append(names, row.name)
 	}
-	return s.inTransaction(ctx, func(transaction pgx.Tx) error {
+	applied := false
+	err = s.inTransaction(ctx, func(transaction pgx.Tx) error {
 		if _, err := transaction.Exec(ctx, lockSubscriber, subscriber); err != nil {
 			return wrapDriverError(err, "put subscriptions of %s: lock", subscriber)
+		}
+		if !registeredAt.IsZero() {
+			var newest bool
+			err := transaction.QueryRow(ctx, claimRegistration, subscriber, registeredAt).Scan(&newest)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil // superseded
+			}
+			if err != nil {
+				return wrapDriverError(err, "put subscriptions of %s: order the registration", subscriber)
+			}
 		}
 		if _, err := transaction.Exec(ctx, deleteMissingSubscriptions, subscriber, names); err != nil {
 			return wrapDriverError(err, "put subscriptions of %s: delete the removed ones", subscriber)
@@ -72,8 +102,10 @@ func (s *Store) PutSubscriptions(ctx context.Context, subscriber string, subscri
 				return wrapDriverError(err, "put subscription %s/%s", subscriber, row.name)
 			}
 		}
+		applied = true
 		return nil
 	})
+	return applied && err == nil, err
 }
 
 // subscriptionRow is one validated subscription as stored.
