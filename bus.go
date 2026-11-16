@@ -2,8 +2,6 @@ package events
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -343,14 +341,9 @@ func (b *Bus) Register(ctx context.Context) error {
 	registrations := make([]*jobs.PreparedJob, 0, len(b.publishers))
 	for name := range b.publishers {
 		payload := b.registration(name)
-		encoded, err := json.Marshal(payload) // before RegisteredAt: the same set coalesces with a pending job
-		if err != nil {
-			return fmt.Errorf("events: encode the registration at %s: %w", name, err)
-		}
-		digest := sha256.Sum256(encoded) // a pending job of another set is not coalesced with this one
-		uniqueKey := name + "/" + hex.EncodeToString(digest[:8])
 		payload.RegisteredAt = registeredAt
-		registrations = append(registrations, registerKind.New(payload, &jobs.EnqueueOptions{UniqueKey: uniqueKey}))
+		// no unique key: a call coalesced into a pending job of its set would keep that job's older time (E31)
+		registrations = append(registrations, registerKind.New(payload, nil))
 	}
 	if err := b.store.Enqueue(ctx, registrations...); err != nil {
 		return fmt.Errorf("events: enqueue the registrations: %w", err)

@@ -624,7 +624,6 @@ func TestARedeliveryWhileAnAttemptIsInFlightRunsTheHandlerOnce(t *testing.T) {
 	ctx := context.Background()
 	arrived, release := make(chan struct{}), make(chan struct{})
 	releaseOnce := sync.OnceFunc(func() { close(release) })
-	t.Cleanup(releaseOnce) // before the servers close, also when the test fails early
 	var requests atomic.Int32
 	orders, billing, invoices := remotePair(t, &serviceOptions{intercept: func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -635,6 +634,7 @@ func TestARedeliveryWhileAnAttemptIsInFlightRunsTheHandlerOnce(t *testing.T) {
 			next.ServeHTTP(writer, request)
 		})
 	}})
+	t.Cleanup(releaseOnce) // after remotePair's, so it runs before the servers close, also when the test fails early
 	id := orders.publish(t, OrderPlaced{OrderID: "o-1"})
 	key := events.DeliveryKey{Subscriber: "billing", Subscription: "create-invoice", EventID: id}
 	first := make(chan error, 1)
@@ -692,6 +692,34 @@ func TestTwoSetsRegisteredBeforeAnyRunEndWithTheNewerOneInEitherOrder(t *testing
 	require.Len(t, orders.observer.registrations, 2)
 	require.False(t, orders.observer.registrations[0].Superseded)
 	require.True(t, orders.observer.registrations[1].Superseded, "the older registration changed nothing")
+}
+
+func TestARegisterOfASetThatIsAlreadyPendingKeepsItsOwnTime(t *testing.T) {
+	ctx := context.Background()
+	orders := newService(t, "orders", nil)
+	registeringAt := func(ago time.Duration) func(options *events.Options) {
+		return func(options *events.Options) {
+			options.Publishers = []events.Publisher{publisherOf(orders)}
+			options.Now = func() time.Time { return time.Now().Add(-ago) }
+		}
+	}
+	var invoices received
+	subscribe := func(bus *events.Bus, names ...string) {
+		for _, name := range names {
+			require.NoError(t, events.Subscribe(bus, orderPlacedTopic, invoices.handle, &events.SubscribeOptions{Name: name, Publisher: "orders"}))
+		}
+		require.NoError(t, bus.Register(ctx))
+	}
+	billing := newService(t, "billing", &serviceOptions{configure: registeringAt(2 * time.Minute)})
+	subscribe(billing.bus, "create-invoice", "send-receipt") // a pod of the new release
+	old, _ := billing.replica(t, registeringAt(time.Minute))
+	subscribe(old, "create-invoice") // a pod of the old release starts, a rollback
+	again, _ := billing.replica(t, registeringAt(0))
+	subscribe(again, "create-invoice", "send-receipt") // the new release again, before any job ran
+
+	require.Equal(t, 3, pendingRegistrations(t, billing), "the newest call is not swallowed by the pending job of its set")
+	require.Equal(t, 3, billing.drain(t))
+	require.Equal(t, []string{"create-invoice", "send-receipt"}, registeredNames(t, orders, "billing"))
 }
 
 func TestAnOlderRegistrationThatRetriesAfterANewerOneChangesNothing(t *testing.T) {
