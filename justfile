@@ -20,8 +20,8 @@ lint:
     go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
 
+# The launcher starts one PostgreSQL that all test binaries share; `go test ./<package>` alone starts its own.
 # Unit tests of changed and affected packages; the Go test cache replays the rest (TST-014). Fails below the coverage threshold (TST-010).
-# The launcher starts one PostgreSQL for every test binary; `go test ./<package>` alone starts its own
 test *flags:
     mkdir -p sandbox
     {{postgrestest}} {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -coverprofile=sandbox/unit.raw.cover {{flags}} ./...

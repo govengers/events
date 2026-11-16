@@ -255,6 +255,36 @@ func TestPublishFansOutInTheCallersTransaction(t *testing.T) {
 	require.Equal(t, "events.billing", queue)
 }
 
+// The migrations and every query run in the schema the store's pool uses (MigrationV1's
+// contract): a pool whose search_path names only its own schema publishes there, not in public.
+func TestTheStoreUsesTheSchemaOfItsPool(t *testing.T) {
+	ctx := context.Background()
+	database := postgrestest.New(t)
+	_, err := database.Exec(ctx, "CREATE SCHEMA orders")
+	require.NoError(t, err)
+	configuration := database.Config().Copy()
+	configuration.ConnConfig.RuntimeParams["search_path"] = "orders"
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	transaction, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	for _, migration := range []string{jobspostgres.MigrationV1, postgresadapter.MigrationV1} {
+		_, err = transaction.Exec(ctx, migration)
+		require.NoError(t, err)
+	}
+	require.NoError(t, transaction.Commit(ctx))
+
+	store, _ := storeOn(t, pool, nil)
+	require.NoError(t, store.PutSubscriptions(ctx, "billing", []events.Subscription{remote("create-invoice")}))
+	_, err = store.Publish(ctx, pool, orderPlacedTopic.New(orderPlaced{OrderID: "o-1"}))
+	require.NoError(t, err)
+	require.Equal(t, 1, count(t, pool, "orders.govengers_event_deliveries"))
+	require.Equal(t, 1, count(t, pool, "orders.govengers_jobs"))
+	require.Zero(t, count(t, pool, "public.govengers_event_deliveries"))
+	require.Zero(t, count(t, pool, "public.govengers_jobs"))
+}
+
 type traceCarrier struct{}
 
 func (traceCarrier) Inject(_ context.Context, headers map[string]string) error {
