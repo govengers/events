@@ -9,7 +9,7 @@ ids, err := eventStore.Publish(ctx, pool, contract.OrderPlacedTopic.New(contract
 jobstest.Drain(t, worker) // runs the local subscriptions' handlers
 ```
 
-For a remote subscription, run both services in one test: two schemas of one embedded PostgreSQL, two `httptest` servers with the inbox and registration handlers, `Register` then `Drain` on each side. A retry waits for its backoff; make it due instead of sleeping:
+For a remote subscription, run both services in one test: two databases of one PostgreSQL (two `Pool(t)` calls of `github.com/govengers/postgrestest`), two `httptest` servers with the inbox and registration handlers, `Register` then `Drain` on each side. A retry waits for its backoff; make it due instead of sleeping:
 
 ```go
 _, err := pool.Exec(ctx, "UPDATE govengers_jobs SET run_at = now() WHERE status = 'pending'")
@@ -19,6 +19,6 @@ _, err := pool.Exec(ctx, "UPDATE govengers_jobs SET run_at = now() WHERE status 
 
 ## In this repository
 
-- `just test`: unit and integration tests, one embedded PostgreSQL per test binary, a schema per test, a few seconds per package.
+- `just test`: unit and integration tests on one PostgreSQL for the whole run (the `github.com/govengers/postgrestest` launcher), a database per test copied from a migrated template, a few seconds per package. `go test ./<package>` starts a PostgreSQL of its own.
 - `just test-e2e`: the shop example's two binaries on two databases, billing stopped and started again; skipped when nothing it covers changed.
 - `just check`: lint, tests, e2e, vulncheck: what CI runs.

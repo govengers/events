@@ -33,7 +33,7 @@ func newStore(t *testing.T, adjust func(options *postgresadapter.Options)) (*pos
 	return storeOn(t, postgrestest.New(t), adjust)
 }
 
-// repeatableRead returns a second pool on the same schema whose transactions default to
+// repeatableRead returns a second pool on the same database whose transactions default to
 // REPEATABLE READ, the setting under which an unpinned multi-statement path breaks.
 func repeatableRead(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
@@ -253,6 +253,36 @@ func TestPublishFansOutInTheCallersTransaction(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx, "SELECT kind, queue FROM govengers_jobs WHERE kind LIKE 'events.%' LIMIT 1").Scan(&kind, &queue))
 	require.Equal(t, "events.billing.audit", kind)
 	require.Equal(t, "events.billing", queue)
+}
+
+// The migrations and every query run in the schema the store's pool uses (MigrationV1's
+// contract): a pool whose search_path names only its own schema publishes there, not in public.
+func TestTheStoreUsesTheSchemaOfItsPool(t *testing.T) {
+	ctx := context.Background()
+	database := postgrestest.New(t)
+	_, err := database.Exec(ctx, "CREATE SCHEMA orders")
+	require.NoError(t, err)
+	configuration := database.Config().Copy()
+	configuration.ConnConfig.RuntimeParams["search_path"] = "orders"
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	transaction, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	for _, migration := range []string{jobspostgres.MigrationV1, postgresadapter.MigrationV1} {
+		_, err = transaction.Exec(ctx, migration)
+		require.NoError(t, err)
+	}
+	require.NoError(t, transaction.Commit(ctx))
+
+	store, _ := storeOn(t, pool, nil)
+	require.NoError(t, store.PutSubscriptions(ctx, "billing", []events.Subscription{remote("create-invoice")}))
+	_, err = store.Publish(ctx, pool, orderPlacedTopic.New(orderPlaced{OrderID: "o-1"}))
+	require.NoError(t, err)
+	require.Equal(t, 1, count(t, pool, "orders.govengers_event_deliveries"))
+	require.Equal(t, 1, count(t, pool, "orders.govengers_jobs"))
+	require.Zero(t, count(t, pool, "public.govengers_event_deliveries"))
+	require.Zero(t, count(t, pool, "public.govengers_jobs"))
 }
 
 type traceCarrier struct{}
